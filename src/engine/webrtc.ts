@@ -1,26 +1,41 @@
+import { detectDeviceProfile, lowWatermarkFor } from './autotune';
+import {
+  buildPresetSteps,
+  summarizeBenchmarkSuite,
+  type BenchmarkPresetId,
+  type BenchmarkRunResult,
+  type BenchmarkStepSpec,
+  type BenchmarkSuiteSummary,
+  type BenchmarkUserMetadata,
+} from './benchmark';
 import { ChannelPool } from './channelPool';
-import { negotiateChunkSize } from './framing';
 import {
   buildRtcConfig,
+  emptyTelemetrySnapshot,
   IceCascadeMonitor,
+  sampleLinkTelemetry,
   type CascadeStage,
   type LinkTelemetrySnapshot,
 } from './iceCascade';
 import { chooseSaveTarget, hasQuotaFor, triggerDownload } from './opfsDiskStream';
 import {
   CHANNEL_COUNT,
-  DEGRADED_CHANNELS,
-  DEGRADED_CHUNK,
-  DEGRADED_RTT_MS,
   DEFAULT_CHUNK,
+  INITIAL_HIGH_WATERMARK,
+  LANE_CHANNELS,
+  LOW_WATERMARK,
   MAX_CHUNK,
-  MIN_CHUNK,
   randomId,
   type ControlMessage,
   type FileOfferMeta,
   type FromWorker,
   type IceRoute,
+  type PeerCaps,
+  type SinkKind,
+  type TuneConfig,
+  type TunerSnapshot,
   type ToWorker,
+  type WorkerChannelMode,
 } from './protocol';
 
 export type SignalWirePayload =
@@ -57,12 +72,18 @@ export interface TransferRecord {
   bytesTransferred: number;
   wireBytesTransferred: number;
   throughputMBps: number | null;
+  wireThroughputMBps: number | null;
   etaSeconds: number | null;
   compressionRatio: number | null;
   chunkSize: number;
   activeChannels: number;
+  activeLanes: number;
   route: IceRoute;
+  candidatePairLabel: string;
   rttMs: number | null;
+  sink: SinkKind | null;
+  integrityVerified: boolean | null;
+  finalizeMs: number | null;
   savedVia: 'filesystem-handle' | 'opfs-download' | null;
   errorMessage: string | null;
   startedAt: number | null;
@@ -74,24 +95,51 @@ export interface TelemetryHUDState {
   peerName: string | null;
   connectionState: RTCPeerConnectionState | 'idle';
   route: IceRoute;
+  candidatePairLabel: string;
   protocol: string | null;
   rttMs: number | null;
   throughputMBps: number;
+  wireThroughputMBps: number;
+  statsWireMBps: number;
   compressionRatio: number | null;
   compressed: boolean;
   chunkSize: number;
   maxSctpMessageSize: number | null;
   activeChannels: number;
+  activeLanes: number;
+  connectedLanes: number;
+  highWatermark: number;
+  lowWatermark: number;
   channelBufferedBytes: number[];
-  workerMode: 'native-worker-dc' | 'zero-copy-bridge';
+  channelLaneIds: string[];
+  workerMode: WorkerChannelMode;
+  sink: SinkKind | null;
+  receiverPendingBytes: number;
+  tuner: TunerSnapshot | null;
   lz4Ready: boolean;
   opfsReady: boolean;
+  opfsSyncReady: boolean;
+  secureContext: boolean;
   degraded: boolean;
 }
 
 interface SpeedSample {
   t: number;
   bytes: number;
+  wireBytes: number;
+}
+
+interface ExtraLane {
+  id: string;
+  pc: RTCPeerConnection;
+  channels: RTCDataChannel[];
+  bridgeOnly: boolean;
+  makingOffer: boolean;
+  ignoreOffer: boolean;
+  isSettingRemoteAnswerPending: boolean;
+  pendingCandidates: RTCIceCandidateInit[];
+  openWaiters: Array<() => void>;
+  closed: boolean;
 }
 
 interface PeerLink {
@@ -103,9 +151,10 @@ interface PeerLink {
   pc: RTCPeerConnection;
   ctrl: RTCDataChannel;
   dataChannels: RTCDataChannel[];
-  /** Non-null in zero-copy Transferable ArrayBuffer bridge mode; null when channels live inside worker. */
   bridgePool: ChannelPool | null;
   nativeWorkerChannels: boolean;
+  peerCaps: PeerCaps;
+  extraLanes: Map<string, ExtraLane>;
   cascade: IceCascadeMonitor;
   makingOffer: boolean;
   ignoreOffer: boolean;
@@ -113,12 +162,36 @@ interface PeerLink {
   pendingCandidates: RTCIceCandidateInit[];
   openWaiters: Array<{ resolve: () => void; reject: (err: Error) => void }>;
   telemetry: LinkTelemetrySnapshot;
+  statsWireMBps: number;
+  lastStatsSample: { t: number; totalBytes: number } | null;
   pingRttMs: number | null;
+  pingWaiters: Map<string, (rttMs: number) => void>;
   buffered: number[];
+  channelLaneIds: string[];
   activeChannels: number;
+  highWatermark: number;
+  lowWatermark: number;
+  lastTuner: TunerSnapshot | null;
+  lastSink: SinkKind | null;
+  receiverPendingBytes: number;
   pendingAckBytes: number;
   ackScheduled: boolean;
+  bridgeHandoffs: number;
+  bridgeWaitMs: number;
   disposed: boolean;
+}
+
+interface ActiveBenchSender {
+  id: string;
+  link: PeerLink;
+  setupStartedAt: number;
+  setupMs: number;
+  readyResolve: ((info: { window: number; sink: SinkKind }) => void) | null;
+  readyReject: ((err: Error) => void) | null;
+  drainedData: Extract<FromWorker, { type: 'send-drained' }> | null;
+  remoteResult: Extract<ControlMessage, { t: 'bench-result' }> | null;
+  doneResolve: (() => void) | null;
+  doneReject: ((err: Error) => void) | null;
 }
 
 export interface WarpEngineCallbacks {
@@ -129,10 +202,15 @@ export interface WarpEngineCallbacks {
   onRemoteHello?: (peerId: string, name: string, deviceKind: 'desktop' | 'mobile' | 'extension') => void;
 }
 
+const HOST_HEAD_START_MS = 650;
+
 export class WarpWebRTCEngine {
+  private readonly deviceProfile = detectDeviceProfile();
   private readonly worker: Worker;
   private lz4Ready = false;
   private opfsReady = false;
+  private opfsSyncReady = false;
+  private secureContext = typeof window !== 'undefined' ? Boolean(window.isSecureContext) : true;
   private workerReadyResolve!: () => void;
   private readonly workerReadyPromise: Promise<void>;
 
@@ -141,12 +219,18 @@ export class WarpWebRTCEngine {
   private readonly transfers = new Map<string, TransferRecord>();
   private readonly sourceFiles = new Map<string, File>();
   private readonly speedHistory = new Map<string, SpeedSample[]>();
-  private readonly sendDrainedSet = new Set<string>();
-  private readonly remoteCompletedSet = new Set<string>();
+  private readonly sendDrainedHashes = new Map<string, string>();
+  private readonly remoteCompletedInfo = new Map<
+    string,
+    { hash?: string; sink?: SinkKind; writeMs?: number; finalizeMs?: number }
+  >();
   private readonly pendingAnalyses = new Map<
     string,
     { resolve: (v: { entropy: number; compress: boolean }) => void; reject: (e: Error) => void }
   >();
+  private readonly benchSenders = new Map<string, ActiveBenchSender>();
+  private readonly benchRecvLinks = new Map<string, PeerLink>();
+  private benchAborted = false;
 
   private telemetryTimer: ReturnType<typeof setInterval> | null = null;
   private focusedPeerId: string | null = null;
@@ -169,11 +253,25 @@ export class WarpWebRTCEngine {
     }, 450);
   }
 
+  private get selfCaps(): PeerCaps {
+    return {
+      lanes: this.deviceProfile.maxExtraLanes,
+      credit: true,
+      bench: true,
+      userAgentSummary: this.deviceProfile.summary,
+    };
+  }
+
   setSelfName(name: string): void {
     this.selfName = name;
     for (const link of this.links.values()) {
       if (link.ctrl.readyState === 'open') {
-        this.sendControl(link, { t: 'hello', name: this.selfName, deviceKind: this.selfDeviceKind });
+        this.sendControl(link, {
+          t: 'hello',
+          name: this.selfName,
+          deviceKind: this.selfDeviceKind,
+          caps: this.selfCaps,
+        });
       }
     }
   }
@@ -183,11 +281,28 @@ export class WarpWebRTCEngine {
     this.emitHud();
   }
 
+  applyRecommendedConfig(peerId: string, config: Partial<TuneConfig>): void {
+    const link = this.links.get(peerId);
+    if (!link) return;
+    this.postWorker({ type: 'seed', linkId: link.linkId, config });
+  }
+
+  cancelBenchmarks(): void {
+    this.benchAborted = true;
+    for (const b of [...this.benchSenders.values()]) {
+      this.postWorker({ type: 'cancel', transferId: b.id });
+      this.sendControl(b.link, { t: 'cancel', id: b.id, reason: 'Benchmark stopped' });
+      b.readyReject?.(new Error('Benchmark cancelled'));
+      b.doneReject?.(new Error('Benchmark cancelled'));
+      this.benchSenders.delete(b.id);
+    }
+  }
+
   getTransfers(): TransferRecord[] {
     return [...this.transfers.values()].sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
   }
 
-  /** Pre-warms or awaits the dedicated 5-channel WebRTC transport to `peerId`. */
+  /** Pre-warms or awaits the dedicated primary WebRTC transport to `peerId`. */
   async ensureLink(peerId: string, peerName: string): Promise<PeerLink> {
     await this.workerReadyPromise;
     let link = this.links.get(peerId);
@@ -223,7 +338,6 @@ export class WarpWebRTCEngine {
     });
   }
 
-  /** Proactively initiates background handshake when a peer appears on the radar. */
   warmPeer(peerId: string, peerName: string): void {
     if (this.links.has(peerId)) {
       const existing = this.links.get(peerId)!;
@@ -255,7 +369,7 @@ export class WarpWebRTCEngine {
       this.teardownLink(link, null);
       link = undefined;
     } else if (link && payload.gen < link.gen) {
-      return; // Stale signal from a superseded ICE generation.
+      return;
     }
 
     if (!link) {
@@ -318,10 +432,8 @@ export class WarpWebRTCEngine {
     }
   }
 
-  /**
-   * Wraps a local OS `File` in a zero-copy pointer offer, runs the 64 KB Shannon
-   * entropy probe inside the worker, and dispatches the offer to `peerId`.
-   */
+  // ───────────────────────── File Transfers ─────────────────────────
+
   async sendFileOffer(peerId: string, peerName: string, file: File): Promise<string> {
     await this.workerReadyPromise;
     this.focusedPeerId = peerId;
@@ -340,12 +452,18 @@ export class WarpWebRTCEngine {
       bytesTransferred: 0,
       wireBytesTransferred: 0,
       throughputMBps: null,
+      wireThroughputMBps: null,
       etaSeconds: null,
       compressionRatio: null,
       chunkSize: DEFAULT_CHUNK,
       activeChannels: CHANNEL_COUNT,
+      activeLanes: 1,
       route: 'unknown',
+      candidatePairLabel: 'standby',
       rttMs: null,
+      sink: null,
+      integrityVerified: null,
+      finalizeMs: null,
       savedVia: null,
       errorMessage: null,
       startedAt: Date.now(),
@@ -363,7 +481,14 @@ export class WarpWebRTCEngine {
       this.emitTransfers();
 
       const link = await this.ensureLink(peerId, peerName);
+      // Pre-spin parallel SCTP lanes in background for large files (>= 8 MiB) on non-relay routes
+      if (file.size >= 8 * 1024 * 1024 && link.telemetry.route !== 'relay') {
+        const targetExtra = Math.min(this.deviceProfile.maxExtraLanes, link.peerCaps.lanes);
+        if (targetExtra > 0) void this.ensureExtraLanes(link, targetExtra);
+      }
+
       record.route = link.telemetry.route;
+      record.candidatePairLabel = link.telemetry.candidatePairLabel;
       record.rttMs = link.telemetry.rttMs ?? link.pingRttMs;
       record.status = 'offering';
       this.emitTransfers();
@@ -388,7 +513,6 @@ export class WarpWebRTCEngine {
     }
   }
 
-  /** Accepts an incoming file pointer offer (must be called directly from a user click handler). */
   async acceptOffer(transferId: string): Promise<void> {
     const record = this.transfers.get(transferId);
     if (!record || record.direction !== 'receive' || record.status !== 'offered') return;
@@ -402,10 +526,7 @@ export class WarpWebRTCEngine {
     }
 
     const saveChoice = await chooseSaveTarget(record.fileName);
-    if (saveChoice.kind === 'cancelled') {
-      // User dismissed the OS file picker — keep the offer pending so they can choose again.
-      return;
-    }
+    if (saveChoice.kind === 'cancelled') return;
 
     const quota = await hasQuotaFor(record.fileSize);
     if (!quota.ok && saveChoice.kind !== 'handle') {
@@ -419,7 +540,7 @@ export class WarpWebRTCEngine {
     record.savedVia = saveChoice.kind === 'handle' ? 'filesystem-handle' : 'opfs-download';
     record.status = 'transferring';
     record.startedAt = Date.now();
-    this.speedHistory.set(transferId, [{ t: performance.now(), bytes: 0 }]);
+    this.speedHistory.set(transferId, [{ t: performance.now(), bytes: 0, wireBytes: 0 }]);
     this.emitTransfers();
 
     this.postWorker({
@@ -430,6 +551,8 @@ export class WarpWebRTCEngine {
       size: record.fileSize,
       compress: record.compressed,
       saveHandle: saveChoice.kind === 'handle' ? saveChoice.handle : null,
+      bench: false,
+      preferredSink: 'auto',
     });
   }
 
@@ -450,6 +573,7 @@ export class WarpWebRTCEngine {
     if (!record || record.status !== 'transferring') return;
     record.status = 'paused';
     record.throughputMBps = 0;
+    record.wireThroughputMBps = 0;
     record.etaSeconds = null;
     this.speedHistory.delete(transferId);
     if (record.direction === 'send') {
@@ -467,7 +591,9 @@ export class WarpWebRTCEngine {
     const record = this.transfers.get(transferId);
     if (!record || record.status !== 'paused') return;
     record.status = 'transferring';
-    this.speedHistory.set(transferId, [{ t: performance.now(), bytes: record.bytesTransferred }]);
+    this.speedHistory.set(transferId, [
+      { t: performance.now(), bytes: record.bytesTransferred, wireBytes: record.wireBytesTransferred },
+    ]);
     if (record.direction === 'send') {
       this.postWorker({ type: 'user-pause', transferId, paused: false });
     }
@@ -485,6 +611,7 @@ export class WarpWebRTCEngine {
     if (record.status === 'completed' || record.status === 'cancelled' || record.status === 'declined') return;
     record.status = 'cancelled';
     record.throughputMBps = null;
+    record.wireThroughputMBps = null;
     record.etaSeconds = null;
     record.completedAt = Date.now();
     this.sourceFiles.delete(transferId);
@@ -500,20 +627,260 @@ export class WarpWebRTCEngine {
 
   clearFinishedTransfers(): void {
     for (const [id, rec] of this.transfers) {
-      if (rec.status === 'completed' || rec.status === 'cancelled' || rec.status === 'declined' || rec.status === 'failed') {
+      if (
+        rec.status === 'completed' ||
+        rec.status === 'cancelled' ||
+        rec.status === 'declined' ||
+        rec.status === 'failed'
+      ) {
         this.transfers.delete(id);
       }
     }
     this.emitTransfers();
   }
 
+  // ───────────────────────── Repeatable Benchmark Suite (P0–P6) ─────────────────────────
+
+  async runBenchmarkSuite(
+    peerId: string,
+    peerName: string,
+    preset: BenchmarkPresetId,
+    userMeta: BenchmarkUserMetadata,
+    onProgress?: (status: { stepIndex: number; totalSteps: number; stepLabel: string; completed: BenchmarkRunResult[] }) => void,
+  ): Promise<BenchmarkSuiteSummary> {
+    this.benchAborted = false;
+    this.focusedPeerId = peerId;
+    const link = await this.ensureLink(peerId, peerName);
+    await this.refreshLinkStats(link);
+
+    // Ensure parallel SCTP lanes are ready before multi-lane or autotuned suites
+    const maxExtra =
+      link.telemetry.route === 'relay' ? 0 : Math.min(this.deviceProfile.maxExtraLanes, link.peerCaps.lanes);
+    if (maxExtra > 0 && (preset === 'quick-autotune' || preset === 'repeat-3x' || preset === 'channel-lane-sweep')) {
+      await this.ensureExtraLanes(link, maxExtra);
+    }
+
+    const totalPossibleLanes = 1 + link.extraLanes.size;
+    const steps = buildPresetSteps(
+      preset,
+      link.pc.sctp?.maxMessageSize ?? null,
+      totalPossibleLanes,
+      this.opfsReady,
+      this.opfsSyncReady,
+      link.nativeWorkerChannels,
+    );
+
+    const results: BenchmarkRunResult[] = [];
+    for (let i = 0; i < steps.length; i++) {
+      if (this.benchAborted) throw new Error('Benchmark cancelled');
+      const step = steps[i];
+      onProgress?.({ stepIndex: i, totalSteps: steps.length, stepLabel: step.label, completed: [...results] });
+      const res = await this.runSingleBenchmarkStep(link, step, userMeta);
+      results.push(res);
+      onProgress?.({ stepIndex: i + 1, totalSteps: steps.length, stepLabel: step.label, completed: [...results] });
+      // Brief inter-step settle gap
+      await new Promise((r) => setTimeout(r, 180));
+    }
+
+    const summary = summarizeBenchmarkSuite(preset, results);
+    if (summary.recommendedConfig) {
+      this.applyRecommendedConfig(peerId, summary.recommendedConfig);
+    }
+    return summary;
+  }
+
+  private async runSingleBenchmarkStep(
+    link: PeerLink,
+    step: BenchmarkStepSpec,
+    userMeta: BenchmarkUserMetadata,
+  ): Promise<BenchmarkRunResult> {
+    const id = `bench-${randomId(6)}`;
+    let tempBridgeLane: string | null = null;
+    if (step.forceBridge && link.nativeWorkerChannels) {
+      tempBridgeLane = await this.openTemporaryBridgeLane(link);
+    }
+
+    try {
+      const ctrlPingIdleMs = await this.measureControlPing(link, 800);
+      const statsBefore = await this.sumAllLanesStats(link);
+      const bridgeHandoffsBefore = link.bridgeHandoffs;
+      const bridgeWaitBefore = link.bridgeWaitMs;
+
+      const benchState: ActiveBenchSender = {
+        id,
+        link,
+        setupStartedAt: performance.now(),
+        setupMs: 0,
+        readyResolve: null,
+        readyReject: null,
+        drainedData: null,
+        remoteResult: null,
+        doneResolve: null,
+        doneReject: null,
+      };
+      this.benchSenders.set(id, benchState);
+
+      const readyPromise = new Promise<{ window: number; sink: SinkKind }>((resolve, reject) => {
+        benchState.readyResolve = resolve;
+        benchState.readyReject = reject;
+        setTimeout(() => reject(new Error('Receiver did not acknowledge benchmark start')), 10_000);
+      });
+
+      const donePromise = new Promise<void>((resolve, reject) => {
+        benchState.doneResolve = resolve;
+        benchState.doneReject = reject;
+        setTimeout(() => reject(new Error('Timed out waiting for benchmark completion')), step.durationMs + 15_000);
+      });
+
+      this.sendControl(link, {
+        t: 'bench-offer',
+        id,
+        compress: step.compress && this.lz4Ready,
+        preferredSink: step.preferredSink,
+        windowOverride: step.windowOverride,
+      });
+
+      const { window: creditWindow, sink: negotiatedSink } = await readyPromise;
+      benchState.setupMs = Math.round((performance.now() - benchState.setupStartedAt) * 10) / 10;
+
+      // Sync maxMessageSize before starting worker
+      const maxMsg = link.pc.sctp?.maxMessageSize ?? MAX_CHUNK + 64;
+      this.postWorker({
+        type: 'net',
+        linkId: link.linkId,
+        rttMs: link.telemetry.rttMs ?? link.pingRttMs ?? 1,
+        maxMessageSize: maxMsg,
+      });
+
+      const streamStart = performance.now();
+      let ctrlPingLoadedMs: number | null = null;
+      const loadedPingTimer = setTimeout(() => {
+        void this.measureControlPing(link, 1_200).then((ms) => {
+          ctrlPingLoadedMs = ms;
+        });
+      }, Math.floor(step.durationMs * 0.5));
+
+      this.postWorker({
+        type: 'send-start',
+        linkId: link.linkId,
+        transferId: id,
+        file: null,
+        compressibleBench: step.compressible,
+        forceBridge: Boolean(step.forceBridge),
+        compress: step.compress && this.lz4Ready,
+        creditWindow,
+        durationMs: step.durationMs,
+        pinned: step.pinned ?? null,
+      });
+
+      await donePromise;
+      clearTimeout(loadedPingTimer);
+
+      const statsAfter = await this.sumAllLanesStats(link);
+      const wallElapsedSec = Math.max(0.001, (performance.now() - streamStart) / 1000);
+      const drained = benchState.drainedData!;
+      const remote = benchState.remoteResult!;
+
+      const elapsedMs = Math.max(drained.elapsedMs, remote.elapsedMs, 1);
+      const appMBps = Math.round((remote.bytes / (1024 * 1024) / (elapsedMs / 1000)) * 10) / 10;
+      const wireMBps = Math.round((drained.wireBytes / (1024 * 1024) / (elapsedMs / 1000)) * 10) / 10;
+      const statsDeltaBytes = Math.max(0, statsAfter.bytesSent - statsBefore.bytesSent);
+      const statsWireMBps = Math.round((statsDeltaBytes / (1024 * 1024) / wallElapsedSec) * 10) / 10;
+
+      const receiverWriteMBps =
+        remote.sink !== 'discard' && remote.writeMs > 2
+          ? Math.round((remote.bytes / (1024 * 1024) / (remote.writeMs / 1000)) * 10) / 10
+          : null;
+
+      const finalTuner = drained.finalTuner;
+      const usedBridge = Boolean(step.forceBridge) || !link.nativeWorkerChannels;
+
+      return {
+        id,
+        label: step.label,
+        warmup: Boolean(step.warmup),
+        timestamp: new Date().toISOString(),
+        route: statsAfter.primary.route,
+        candidatePairLabel: statsAfter.primary.candidatePairLabel,
+        localCandidateType: statsAfter.primary.localCandidateType,
+        remoteCandidateType: statsAfter.primary.remoteCandidateType,
+        protocol: statsAfter.primary.protocol,
+        relayProtocol: statsAfter.primary.relayProtocol,
+        rttMs: statsAfter.primary.rttMs ?? link.pingRttMs,
+        ctrlPingIdleMs,
+        ctrlPingLoadedMs,
+        availableOutgoingBitrateMbps: statsAfter.primary.availableOutgoingBitrate
+          ? Math.round((statsAfter.primary.availableOutgoingBitrate / 1_000_000) * 10) / 10
+          : null,
+        bytes: remote.bytes,
+        wireBytes: drained.wireBytes,
+        setupMs: benchState.setupMs,
+        elapsedMs: Math.round(elapsedMs),
+        receiverFinalizeMs: Math.round(remote.finalizeMs * 10) / 10,
+        appMBps,
+        wireMBps,
+        statsWireMBps,
+        compressionRatio:
+          drained.wireBytes > 0 ? Math.round((drained.rawBytes / drained.wireBytes) * 100) / 100 : 1,
+        chunkSize: finalTuner.chunk,
+        activeLanes: usedBridge ? 1 : finalTuner.lanes,
+        activeChannels: finalTuner.channels ?? CHANNEL_COUNT,
+        schedule: finalTuner.schedule ?? 'least-buffered',
+        highWatermark: finalTuner.highWatermark,
+        workerMode: usedBridge ? 'transferable-bridge' : 'native-worker-dc',
+        bridgeHandoffs: Math.max(0, link.bridgeHandoffs - bridgeHandoffsBefore),
+        bridgeWaitMs: Math.round((link.bridgeWaitMs - bridgeWaitBefore) * 10) / 10,
+        queueWaitPct: Math.min(100, Math.round((drained.queueWaitMs / Math.max(1, drained.elapsedMs)) * 100)),
+        creditWaitPct: Math.min(100, Math.round((drained.creditWaitMs / Math.max(1, drained.elapsedMs)) * 100)),
+        diskWaitPct: Math.min(100, Math.round((drained.diskWaitMs / Math.max(1, drained.elapsedMs)) * 100)),
+        bottleneck: finalTuner.bottleneck,
+        tunerDecision: finalTuner.lastDecision,
+        sink: remote.sink ?? negotiatedSink,
+        receiverWriteMs: Math.round(remote.writeMs * 10) / 10,
+        receiverWriteMBps,
+        maxPendingWriteBytes: remote.maxPendingWriteBytes,
+        creditWindowBytes: creditWindow,
+        senderHash: drained.hash,
+        receiverHash: remote.hash,
+        hashMatch: drained.hash === remote.hash && remote.bytes === drained.rawBytes,
+        complete: remote.complete && remote.bytes === drained.rawBytes,
+        senderEnv: this.deviceProfile.summary,
+        receiverEnv: link.peerCaps.userAgentSummary ?? link.peerName,
+        networkTag: userMeta.networkTag,
+        powerTag: userMeta.powerTag,
+      };
+    } finally {
+      this.benchSenders.delete(id);
+      if (tempBridgeLane) {
+        this.closeExtraLane(link, tempBridgeLane, true);
+      }
+    }
+  }
+
+  private measureControlPing(link: PeerLink, timeoutMs: number): Promise<number | null> {
+    if (link.ctrl.readyState !== 'open') return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const probeId = randomId(4);
+      const timer = setTimeout(() => {
+        link.pingWaiters.delete(probeId);
+        resolve(null);
+      }, timeoutMs);
+      link.pingWaiters.set(probeId, (rtt) => {
+        clearTimeout(timer);
+        resolve(rtt);
+      });
+      this.sendControl(link, { t: 'ping', ts: performance.now(), probeId });
+    });
+  }
+
   dispose(): void {
     if (this.telemetryTimer) clearInterval(this.telemetryTimer);
+    this.cancelBenchmarks();
     for (const link of [...this.links.values()]) this.teardownLink(link, null);
     this.worker.terminate();
   }
 
-  // ───────────────────────── Internal: Link Lifecycle ─────────────────────────
+  // ───────────────────────── Internal: Link & Multi-Lane Lifecycle ─────────────────────────
 
   private isInitiatorFor(peerId: string): boolean {
     return this.selfId > peerId;
@@ -552,13 +919,20 @@ export class WarpWebRTCEngine {
       dataChannels,
       bridgePool: null,
       nativeWorkerChannels: false,
+      peerCaps: { lanes: 0, credit: false, bench: false },
+      extraLanes: new Map(),
       cascade: new IceCascadeMonitor(pc, startNegotiation || this.isInitiatorFor(peerId), {
         onRestartIce: () => this.performIceRestart(link),
         onEscalateRelayOnly: () => this.escalateToRelayOnly(link),
         onRouteChanged: (snap) => {
           link.telemetry = snap;
           this.syncActiveTransferRoute(link);
-          this.callbacks.onPeerLinkState?.(link.peerId, link.pc.connectionState, snap.route, snap.rttMs ?? link.pingRttMs);
+          this.callbacks.onPeerLinkState?.(
+            link.peerId,
+            link.pc.connectionState,
+            snap.route,
+            snap.rttMs ?? link.pingRttMs,
+          );
           this.emitHud();
         },
       }),
@@ -567,28 +941,30 @@ export class WarpWebRTCEngine {
       isSettingRemoteAnswerPending: false,
       pendingCandidates: [],
       openWaiters: [],
-      telemetry: {
-        route: 'unknown',
-        localCandidateType: null,
-        remoteCandidateType: null,
-        protocol: null,
-        rttMs: null,
-        availableOutgoingBitrate: null,
-      },
+      telemetry: emptyTelemetrySnapshot(),
+      statsWireMBps: 0,
+      lastStatsSample: null,
       pingRttMs: null,
+      pingWaiters: new Map(),
       buffered: [0, 0, 0, 0],
+      channelLaneIds: ['0', '0', '0', '0'],
       activeChannels: CHANNEL_COUNT,
+      highWatermark: INITIAL_HIGH_WATERMARK,
+      lowWatermark: LOW_WATERMARK,
+      lastTuner: null,
+      lastSink: null,
+      receiverPendingBytes: 0,
       pendingAckBytes: 0,
       ackScheduled: false,
+      bridgeHandoffs: 0,
+      bridgeWaitMs: 0,
       disposed: false,
     };
 
-    // Attempt native Worker RTCDataChannel transfer first; gracefully fall back to
-    // zero-copy Transferable ArrayBuffer bridge mode when unsupported by the runtime.
     let transferredToWorker = false;
     try {
       this.worker.postMessage(
-        { type: 'attach-channels', linkId, channels: dataChannels } satisfies ToWorker,
+        { type: 'attach-channels', linkId, lane: '0', channels: dataChannels } satisfies ToWorker,
         dataChannels as unknown as Transferable[],
       );
       transferredToWorker = true;
@@ -624,38 +1000,54 @@ export class WarpWebRTCEngine {
     return link;
   }
 
-  private wirePeerConnection(link: PeerLink, startNegotiation: boolean): void {
-    const { pc } = link;
+  /**
+   * Wires trickle-ICE candidate gathering with a strict LAN `typ host` head-start:
+   *  • When `typ host` candidates exist during `stage === 'all'`, `srflx` / `relay`
+   *    candidates are held back for `HOST_HEAD_START_MS` (650 ms).
+   *  • If the connection ALREADY reaches `connected`/`completed` using only `host`
+   *    candidates, the deferred NAT-hairpin `srflx` candidates are NEVER sent unless
+   *    ICE later drops to `disconnected` or `failed`.
+   */
+  private wireHostPriorityIce(
+    pc: RTCPeerConnection,
+    stage: CascadeStage,
+    isDisposed: () => boolean,
+    emitCandidate: (candidate: RTCIceCandidateInit) => void,
+  ): void {
     const deferredNonHost: RTCIceCandidateInit[] = [];
     let deferTimer: ReturnType<typeof setTimeout> | null = null;
     let sawHostCandidate = false;
 
-    const flushDeferred = () => {
+    const isDirectConnected = () =>
+      pc.iceConnectionState === 'connected' ||
+      pc.iceConnectionState === 'completed' ||
+      pc.connectionState === 'connected';
+
+    const flushDeferred = (force = false) => {
       if (deferTimer !== null) {
         clearTimeout(deferTimer);
         deferTimer = null;
       }
-      if (link.disposed || deferredNonHost.length === 0) return;
-      // If a direct LAN (`typ host`) link is already connected, don't pollute it with NAT hairpin candidates.
-      if (pc.connectionState === 'connected' && link.telemetry.route === 'host') {
-        deferredNonHost.length = 0;
+      if (isDisposed() || deferredNonHost.length === 0) return;
+      // Do NOT pollute an already-connected pure `typ host` LAN socket with router NAT-hairpin candidates!
+      if (!force && isDirectConnected()) {
         return;
       }
       const batch = deferredNonHost.splice(0);
-      for (const candidate of batch) {
-        this.callbacks.sendSignal(link.peerId, {
-          gen: link.gen,
-          stage: link.stage,
-          kind: 'ice',
-          candidate,
-        });
-      }
+      for (const candidate of batch) emitCandidate(candidate);
     };
 
+    pc.addEventListener('iceconnectionstatechange', () => {
+      if (isDisposed()) return;
+      if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+        flushDeferred(true);
+      }
+    });
+
     pc.addEventListener('icecandidate', (event) => {
-      if (link.disposed) return;
+      if (isDisposed()) return;
       if (!event.candidate) {
-        flushDeferred();
+        flushDeferred(false);
         return;
       }
       const json = event.candidate.toJSON();
@@ -663,32 +1055,37 @@ export class WarpWebRTCEngine {
       const isHost = /\btyp\s+host\b/i.test(candStr);
       if (isHost) {
         sawHostCandidate = true;
-        this.callbacks.sendSignal(link.peerId, {
-          gen: link.gen,
-          stage: link.stage,
-          kind: 'ice',
-          candidate: json,
-        });
+        emitCandidate(json);
         return;
       }
 
-      // Give `typ host` LAN candidates a 180 ms head-start so same-Wi-Fi devices
-      // never nominate a slower `typ srflx` router-hairpin route first.
-      if (link.stage === 'all' && sawHostCandidate && pc.connectionState !== 'connected') {
+      if (stage === 'all' && sawHostCandidate) {
         deferredNonHost.push(json);
-        if (deferTimer === null) {
-          deferTimer = setTimeout(flushDeferred, 180);
+        if (!isDirectConnected() && deferTimer === null) {
+          deferTimer = setTimeout(() => flushDeferred(false), HOST_HEAD_START_MS);
         }
         return;
       }
 
-      this.callbacks.sendSignal(link.peerId, {
-        gen: link.gen,
-        stage: link.stage,
-        kind: 'ice',
-        candidate: json,
-      });
+      emitCandidate(json);
     });
+  }
+
+  private wirePeerConnection(link: PeerLink, startNegotiation: boolean): void {
+    const { pc } = link;
+
+    this.wireHostPriorityIce(
+      pc,
+      link.stage,
+      () => link.disposed,
+      (candidate) =>
+        this.callbacks.sendSignal(link.peerId, {
+          gen: link.gen,
+          stage: link.stage,
+          kind: 'ice',
+          candidate,
+        }),
+    );
 
     pc.addEventListener('negotiationneeded', () => {
       if (link.disposed || !startNegotiation) return;
@@ -719,6 +1116,223 @@ export class WarpWebRTCEngine {
     });
   }
 
+  // ───────────────────────── Parallel SCTP Lanes (L1..LN & Bridge Bench Lb) ─────────────────────────
+
+  private async ensureExtraLanes(link: PeerLink, desiredCount: number): Promise<void> {
+    if (link.disposed || link.ctrl.readyState !== 'open') return;
+    const promises: Promise<void>[] = [];
+    for (let i = 1; i <= desiredCount; i++) {
+      const laneId = `L${i}`;
+      let lane = link.extraLanes.get(laneId);
+      if (!lane || lane.closed || lane.pc.connectionState === 'failed' || lane.pc.connectionState === 'closed') {
+        lane = this.createExtraLane(link, laneId, LANE_CHANNELS, false, true);
+      }
+      if (!lane.channels.some((c) => c.readyState === 'open')) {
+        promises.push(
+          new Promise<void>((resolve) => {
+            const t = setTimeout(resolve, 2_500);
+            lane!.openWaiters.push(() => {
+              clearTimeout(t);
+              resolve();
+            });
+          }),
+        );
+      }
+    }
+    if (promises.length > 0) await Promise.all(promises);
+  }
+
+  private async openTemporaryBridgeLane(link: PeerLink): Promise<string> {
+    const laneId = `B${randomId(2)}`;
+    const lane = this.createExtraLane(link, laneId, CHANNEL_COUNT, true, true);
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('Bridge benchmark lane timed out')), 6_000);
+      lane.openWaiters.push(() => {
+        clearTimeout(t);
+        resolve();
+      });
+    });
+    return laneId;
+  }
+
+  private createExtraLane(
+    link: PeerLink,
+    laneId: string,
+    channelCount: number,
+    bridgeOnly: boolean,
+    initiate: boolean,
+  ): ExtraLane {
+    this.closeExtraLane(link, laneId, false);
+    const pc = new RTCPeerConnection(buildRtcConfig(link.stage));
+    const channels: RTCDataChannel[] = [];
+    for (let i = 0; i < channelCount; i++) {
+      channels.push(
+        pc.createDataChannel(`warp-${laneId}-${i}`, {
+          negotiated: true,
+          id: i,
+          ordered: false,
+        }),
+      );
+    }
+
+    const lane: ExtraLane = {
+      id: laneId,
+      pc,
+      channels,
+      bridgeOnly,
+      makingOffer: false,
+      ignoreOffer: false,
+      isSettingRemoteAnswerPending: false,
+      pendingCandidates: [],
+      openWaiters: [],
+      closed: false,
+    };
+    link.extraLanes.set(laneId, lane);
+
+    const notifyOpen = () => {
+      const waiters = lane.openWaiters.splice(0);
+      for (const w of waiters) w();
+    };
+    for (const ch of channels) {
+      ch.addEventListener('open', notifyOpen, { once: true });
+    }
+
+    const isBridgeLane = bridgeOnly || laneId.startsWith('B') || !link.nativeWorkerChannels;
+    if (!isBridgeLane) {
+      try {
+        this.worker.postMessage(
+          { type: 'attach-channels', linkId: link.linkId, lane: laneId, channels } satisfies ToWorker,
+          channels as unknown as Transferable[],
+        );
+      } catch {
+        this.attachLaneToBridgePool(link, laneId, channels);
+      }
+    } else {
+      this.attachLaneToBridgePool(link, laneId, channels);
+    }
+
+    this.wireHostPriorityIce(
+      pc,
+      link.stage,
+      () => link.disposed || lane.closed,
+      (candidate) => this.sendControl(link, { t: 'lane-ice', lane: laneId, candidate }),
+    );
+
+    if (initiate) {
+      queueMicrotask(async () => {
+        if (link.disposed || lane.closed) return;
+        try {
+          lane.makingOffer = true;
+          await pc.setLocalDescription();
+          if (pc.localDescription && !lane.closed) {
+            this.sendControl(link, {
+              t: 'lane-sdp',
+              lane: laneId,
+              description: { type: pc.localDescription.type, sdp: pc.localDescription.sdp },
+            });
+          }
+        } catch (err) {
+          console.warn('[warp] extra lane offer failed', err);
+        } finally {
+          lane.makingOffer = false;
+        }
+      });
+    }
+
+    return lane;
+  }
+
+  private attachLaneToBridgePool(link: PeerLink, laneId: string, channels: RTCDataChannel[]): void {
+    if (!link.bridgePool) {
+      const pool = new ChannelPool();
+      pool.onValve((open) => {
+        this.postWorker({ type: 'flow', linkId: link.linkId, paused: !open });
+      });
+      link.bridgePool = pool;
+    }
+    link.bridgePool.addLane(laneId, channels);
+    for (const ch of channels) {
+      ch.addEventListener('message', (event: MessageEvent<ArrayBuffer>) => {
+        if (event.data instanceof ArrayBuffer) {
+          this.worker.postMessage(
+            { type: 'chunk-in', linkId: link.linkId, data: event.data } satisfies ToWorker,
+            [event.data],
+          );
+        }
+      });
+    }
+  }
+
+  private closeExtraLane(link: PeerLink, laneId: string, notifyRemote: boolean): void {
+    const lane = link.extraLanes.get(laneId);
+    if (!lane) return;
+    lane.closed = true;
+    link.extraLanes.delete(laneId);
+    link.bridgePool?.removeLane(laneId);
+    this.postWorker({ type: 'detach-lane', linkId: link.linkId, lane: laneId });
+    try {
+      lane.pc.close();
+    } catch {
+      // Ignore.
+    }
+    if (notifyRemote) {
+      this.sendControl(link, { t: 'lane-close', lane: laneId });
+    }
+  }
+
+  private async handleLaneSdp(
+    link: PeerLink,
+    laneId: string,
+    desc: RTCSessionDescriptionInit,
+  ): Promise<void> {
+    let lane = link.extraLanes.get(laneId);
+    if (!lane) {
+      const chCount = laneId.startsWith('B') ? CHANNEL_COUNT : LANE_CHANNELS;
+      lane = this.createExtraLane(link, laneId, chCount, laneId.startsWith('B'), false);
+    }
+    const polite = !this.isInitiatorFor(link.peerId);
+    const { pc } = lane;
+    try {
+      const readyForOffer =
+        !lane.makingOffer && (pc.signalingState === 'stable' || lane.isSettingRemoteAnswerPending);
+      const offerCollision = desc.type === 'offer' && !readyForOffer;
+      lane.ignoreOffer = !polite && offerCollision;
+      if (lane.ignoreOffer) return;
+
+      lane.isSettingRemoteAnswerPending = desc.type === 'answer';
+      await pc.setRemoteDescription(desc);
+      lane.isSettingRemoteAnswerPending = false;
+
+      if (lane.pendingCandidates.length > 0) {
+        for (const cand of lane.pendingCandidates.splice(0)) {
+          await pc.addIceCandidate(cand).catch(() => undefined);
+        }
+      }
+      if (desc.type === 'offer') {
+        await pc.setLocalDescription();
+        if (pc.localDescription) {
+          this.sendControl(link, {
+            t: 'lane-sdp',
+            lane: laneId,
+            description: { type: pc.localDescription.type, sdp: pc.localDescription.sdp },
+          });
+        }
+      }
+    } catch (err) {
+      console.warn('[warp] extra lane SDP error', err);
+    }
+  }
+
+  private async handleLaneIce(link: PeerLink, laneId: string, candidate: RTCIceCandidateInit): Promise<void> {
+    const lane = link.extraLanes.get(laneId);
+    if (!lane) return;
+    if (!lane.pc.remoteDescription || !lane.pc.remoteDescription.type) {
+      lane.pendingCandidates.push(candidate);
+      return;
+    }
+    await lane.pc.addIceCandidate(candidate).catch(() => undefined);
+  }
+
   private async emitInitialOffer(link: PeerLink): Promise<void> {
     if (link.disposed || link.makingOffer || link.pc.signalingState !== 'stable') return;
     try {
@@ -743,7 +1357,12 @@ export class WarpWebRTCEngine {
     const { ctrl } = link;
     ctrl.addEventListener('open', () => {
       if (link.disposed) return;
-      this.sendControl(link, { t: 'hello', name: this.selfName, deviceKind: this.selfDeviceKind });
+      this.sendControl(link, {
+        t: 'hello',
+        name: this.selfName,
+        deviceKind: this.selfDeviceKind,
+        caps: this.selfCaps,
+      });
       this.sendControl(link, { t: 'ping', ts: performance.now() });
       const waiters = link.openWaiters.splice(0);
       for (const w of waiters) w.resolve();
@@ -822,6 +1441,9 @@ export class WarpWebRTCEngine {
     if (this.links.get(link.peerId) === link) this.links.delete(link.peerId);
     this.linkById.delete(link.linkId);
 
+    for (const laneId of [...link.extraLanes.keys()]) {
+      this.closeExtraLane(link, laneId, false);
+    }
     link.cascade.dispose();
     link.bridgePool?.dispose();
     this.postWorker({ type: 'detach', linkId: link.linkId });
@@ -839,6 +1461,16 @@ export class WarpWebRTCEngine {
 
     const waiters = link.openWaiters.splice(0);
     for (const w of waiters) w.reject(new Error(failReason ?? 'Link replaced'));
+    for (const [benchId, recvLink] of this.benchRecvLinks) {
+      if (recvLink === link) this.benchRecvLinks.delete(benchId);
+    }
+    for (const [benchId, sender] of this.benchSenders) {
+      if (sender.link === link) {
+        sender.readyReject?.(new Error(failReason ?? 'Link closed during benchmark'));
+        sender.doneReject?.(new Error(failReason ?? 'Link closed during benchmark'));
+        this.benchSenders.delete(benchId);
+      }
+    }
 
     if (failReason) {
       let changed = false;
@@ -855,6 +1487,7 @@ export class WarpWebRTCEngine {
           rec.status = 'failed';
           rec.errorMessage = failReason;
           rec.throughputMBps = null;
+          rec.wireThroughputMBps = null;
           rec.etaSeconds = null;
           this.sourceFiles.delete(rec.id);
           this.speedHistory.delete(rec.id);
@@ -881,14 +1514,36 @@ export class WarpWebRTCEngine {
     switch (msg.t) {
       case 'hello':
         link.peerName = msg.name || link.peerName;
+        if (msg.caps) link.peerCaps = msg.caps;
         this.callbacks.onRemoteHello?.(link.peerId, link.peerName, msg.deviceKind);
         this.emitHud();
         break;
       case 'ping':
-        this.sendControl(link, { t: 'pong', ts: msg.ts });
+        this.sendControl(link, { t: 'pong', ts: msg.ts, probeId: msg.probeId });
         break;
-      case 'pong':
-        link.pingRttMs = Math.max(0.1, Math.round((performance.now() - msg.ts) * 10) / 10);
+      case 'pong': {
+        const rtt = Math.max(0.1, Math.round((performance.now() - msg.ts) * 10) / 10);
+        link.pingRttMs = rtt;
+        if (msg.probeId) {
+          const waiter = link.pingWaiters.get(msg.probeId);
+          if (waiter) {
+            link.pingWaiters.delete(msg.probeId);
+            waiter(rtt);
+          }
+        }
+        break;
+      }
+      case 'lane-sdp':
+        void this.handleLaneSdp(link, msg.lane, msg.description);
+        break;
+      case 'lane-ice':
+        void this.handleLaneIce(link, msg.lane, msg.candidate);
+        break;
+      case 'lane-close':
+        this.closeExtraLane(link, msg.lane, false);
+        break;
+      case 'credit':
+        this.postWorker({ type: 'credit', transferId: msg.id, bytes: msg.bytes });
         break;
       case 'offer': {
         this.focusedPeerId = link.peerId;
@@ -907,12 +1562,18 @@ export class WarpWebRTCEngine {
           bytesTransferred: 0,
           wireBytesTransferred: 0,
           throughputMBps: null,
+          wireThroughputMBps: null,
           etaSeconds: null,
           compressionRatio: null,
           chunkSize: DEFAULT_CHUNK,
           activeChannels: CHANNEL_COUNT,
+          activeLanes: 1 + link.extraLanes.size,
           route: link.telemetry.route,
+          candidatePairLabel: link.telemetry.candidatePairLabel,
           rttMs: link.telemetry.rttMs ?? link.pingRttMs,
+          sink: null,
+          integrityVerified: null,
+          finalizeMs: null,
           savedVia: null,
           errorMessage: null,
           startedAt: Date.now(),
@@ -927,19 +1588,24 @@ export class WarpWebRTCEngine {
         const rec = this.transfers.get(msg.id);
         const file = this.sourceFiles.get(msg.id);
         if (!rec || !file || rec.direction !== 'send') return;
-        const maxSctp = link.pc.sctp?.maxMessageSize ?? DEFAULT_CHUNK + 1024;
-        const chunkSize = negotiateChunkSize(maxSctp, rec.compressed, MAX_CHUNK, MIN_CHUNK);
-        rec.chunkSize = chunkSize;
+        const maxSctp = link.pc.sctp?.maxMessageSize ?? MAX_CHUNK + 64;
+        this.postWorker({
+          type: 'net',
+          linkId: link.linkId,
+          rttMs: link.telemetry.rttMs ?? link.pingRttMs ?? 1,
+          maxMessageSize: maxSctp,
+        });
+        rec.sink = msg.sink ?? null;
         rec.status = 'transferring';
         rec.startedAt = Date.now();
-        this.speedHistory.set(rec.id, [{ t: performance.now(), bytes: 0 }]);
+        this.speedHistory.set(rec.id, [{ t: performance.now(), bytes: 0, wireBytes: 0 }]);
         this.postWorker({
           type: 'send-start',
           linkId: link.linkId,
           transferId: rec.id,
           file,
           compress: rec.compressed,
-          chunkSize,
+          creditWindow: msg.window && msg.window > 0 ? msg.window : Number.POSITIVE_INFINITY,
         });
         this.emitTransfers();
         this.emitHud();
@@ -959,6 +1625,7 @@ export class WarpWebRTCEngine {
         if (!rec || rec.status !== 'transferring') return;
         rec.status = 'paused';
         rec.throughputMBps = 0;
+        rec.wireThroughputMBps = 0;
         rec.etaSeconds = null;
         this.speedHistory.delete(rec.id);
         if (rec.direction === 'send') {
@@ -972,7 +1639,9 @@ export class WarpWebRTCEngine {
         const rec = this.transfers.get(msg.id);
         if (!rec || rec.status !== 'paused') return;
         rec.status = 'transferring';
-        this.speedHistory.set(rec.id, [{ t: performance.now(), bytes: rec.bytesTransferred }]);
+        this.speedHistory.set(rec.id, [
+          { t: performance.now(), bytes: rec.bytesTransferred, wireBytes: rec.wireBytesTransferred },
+        ]);
         if (rec.direction === 'send') {
           this.postWorker({ type: 'user-pause', transferId: rec.id, paused: false });
         }
@@ -981,37 +1650,85 @@ export class WarpWebRTCEngine {
         break;
       }
       case 'cancel': {
+        this.benchRecvLinks.delete(msg.id);
         const rec = this.transfers.get(msg.id);
+        this.postWorker({ type: 'cancel', transferId: msg.id });
         if (!rec) return;
         rec.status = 'cancelled';
         rec.errorMessage = msg.reason;
         rec.throughputMBps = null;
+        rec.wireThroughputMBps = null;
         rec.etaSeconds = null;
         rec.completedAt = Date.now();
         this.sourceFiles.delete(msg.id);
         this.speedHistory.delete(msg.id);
-        this.postWorker({ type: 'cancel', transferId: msg.id });
         this.emitTransfers();
         this.emitHud();
         break;
       }
       case 'complete': {
-        this.remoteCompletedSet.add(msg.id);
+        this.remoteCompletedInfo.set(msg.id, {
+          hash: msg.hash,
+          sink: msg.sink,
+          writeMs: msg.writeMs,
+          finalizeMs: msg.finalizeMs,
+        });
         this.tryFinalizeSend(msg.id);
         break;
       }
       case 'failed': {
+        const bench = this.benchSenders.get(msg.id);
+        if (bench) {
+          bench.readyReject?.(new Error(msg.reason));
+          bench.doneReject?.(new Error(msg.reason));
+          this.postWorker({ type: 'cancel', transferId: msg.id });
+          return;
+        }
         const rec = this.transfers.get(msg.id);
         if (!rec) return;
         rec.status = 'failed';
         rec.errorMessage = msg.reason;
         rec.throughputMBps = null;
+        rec.wireThroughputMBps = null;
         rec.etaSeconds = null;
         this.sourceFiles.delete(msg.id);
         this.speedHistory.delete(msg.id);
         this.postWorker({ type: 'cancel', transferId: msg.id });
         this.emitTransfers();
         this.emitHud();
+        break;
+      }
+      case 'bench-offer': {
+        this.benchRecvLinks.set(msg.id, link);
+        this.postWorker({
+          type: 'recv-start',
+          linkId: link.linkId,
+          transferId: msg.id,
+          name: `benchmark-${msg.id}.bin`,
+          size: msg.sizeBytes ?? Number.POSITIVE_INFINITY,
+          compress: msg.compress,
+          saveHandle: null,
+          bench: true,
+          preferredSink: msg.preferredSink ?? 'discard',
+          windowOverride: msg.windowOverride,
+        });
+        break;
+      }
+      case 'bench-ready': {
+        const bench = this.benchSenders.get(msg.id);
+        bench?.readyResolve?.({ window: msg.window, sink: msg.sink });
+        break;
+      }
+      case 'bench-stop': {
+        this.postWorker({ type: 'bench-stop', transferId: msg.id, bytes: msg.bytes });
+        break;
+      }
+      case 'bench-result': {
+        const bench = this.benchSenders.get(msg.id);
+        if (bench) {
+          bench.remoteResult = msg;
+          if (bench.drainedData) bench.doneResolve?.();
+        }
         break;
       }
     }
@@ -1036,6 +1753,8 @@ export class WarpWebRTCEngine {
       case 'ready':
         this.lz4Ready = msg.lz4;
         this.opfsReady = msg.opfs;
+        this.opfsSyncReady = msg.opfsSync;
+        this.secureContext = msg.secure;
         this.workerReadyResolve();
         this.emitHud();
         break;
@@ -1049,13 +1768,33 @@ export class WarpWebRTCEngine {
         }
         break;
       }
+      case 'tune': {
+        const link = this.linkById.get(msg.linkId);
+        if (!link) break;
+        link.highWatermark = msg.highWatermark;
+        link.lowWatermark = msg.lowWatermark;
+        if (link.bridgePool) {
+          link.bridgePool.setActiveLanes(msg.lanes);
+          link.bridgePool.setActiveChannelsPerLane(msg.channels);
+          link.bridgePool.setSchedulePolicy(msg.schedule);
+          link.bridgePool.setHighWatermark(msg.highWatermark);
+        }
+        this.emitHud();
+        break;
+      }
       case 'frame-out': {
         const link = this.linkById.get(msg.linkId);
         if (!link || !link.bridgePool) return;
-        const rtt = link.telemetry.rttMs ?? link.pingRttMs ?? 0;
-        link.bridgePool.setActiveCount(rtt > DEGRADED_RTT_MS ? DEGRADED_CHANNELS : CHANNEL_COUNT);
+        const t0 = performance.now();
         const ok = link.bridgePool.send(msg.data);
+        link.bridgeHandoffs++;
         if (!ok) {
+          const bench = this.benchSenders.get(msg.transferId);
+          if (bench) {
+            bench.doneReject?.(new Error('Bridge data channels closed mid-benchmark'));
+            this.postWorker({ type: 'cancel', transferId: msg.transferId });
+            return;
+          }
           const rec = this.transfers.get(msg.transferId);
           if (rec) {
             rec.status = 'failed';
@@ -1070,6 +1809,7 @@ export class WarpWebRTCEngine {
           link.ackScheduled = true;
           queueMicrotask(() => {
             link.ackScheduled = false;
+            link.bridgeWaitMs += performance.now() - t0;
             if (link.disposed || !link.bridgePool) return;
             const bytes = link.pendingAckBytes;
             link.pendingAckBytes = 0;
@@ -1079,23 +1819,54 @@ export class WarpWebRTCEngine {
               bytes,
               paused: !link.bridgePool.canSend,
             });
+            this.postWorker({
+              type: 'bridge-stats',
+              linkId: link.linkId,
+              sentBytes: link.bridgePool.sentBytes,
+              buffered: link.bridgePool.bufferedAmounts,
+              openLanes: link.bridgePool.openLaneCount,
+            });
           });
         }
         break;
       }
       case 'send-progress': {
+        const bench = this.benchSenders.get(msg.transferId);
+        if (bench) {
+          bench.link.lastTuner = msg.tuner;
+          this.emitHud();
+          return;
+        }
         const rec = this.transfers.get(msg.transferId);
         if (!rec || rec.status === 'paused' || rec.status === 'cancelled' || rec.status === 'failed') return;
+        const link = this.links.get(rec.peerId);
+        if (link) link.lastTuner = msg.tuner;
         rec.bytesTransferred = msg.rawBytes;
         rec.wireBytesTransferred = msg.wireBytes;
-        rec.chunkSize = msg.chunkSize;
-        rec.activeChannels = msg.channels;
+        rec.chunkSize = msg.tuner.chunk;
+        rec.activeChannels = msg.tuner.channels ?? CHANNEL_COUNT;
+        rec.activeLanes = msg.tuner.lanes;
         this.updateThroughputAndRatio(rec);
         this.emitTransfers();
         this.emitHud();
         break;
       }
       case 'send-drained': {
+        const bench = this.benchSenders.get(msg.transferId);
+        if (bench) {
+          void (async () => {
+            if (bench.link.bridgePool) await bench.link.bridgePool.flush();
+            bench.drainedData = msg;
+            this.sendControl(bench.link, {
+              t: 'bench-stop',
+              id: msg.transferId,
+              bytes: msg.rawBytes,
+              senderHash: msg.hash,
+            });
+            if (bench.remoteResult) bench.doneResolve?.();
+          })();
+          return;
+        }
         const rec = this.transfers.get(msg.transferId);
         if (!rec) return;
         const link = this.links.get(rec.peerId);
@@ -1103,24 +1874,64 @@ export class WarpWebRTCEngine {
           if (link?.bridgePool) await link.bridgePool.flush();
           rec.bytesTransferred = rec.fileSize;
           if (rec.status === 'transferring') rec.status = 'flushing';
-          this.sendDrainedSet.add(msg.transferId);
+          this.sendDrainedHashes.set(msg.transferId, msg.hash);
           this.tryFinalizeSend(msg.transferId);
           this.emitTransfers();
         })();
         break;
       }
       case 'recv-ready': {
+        if (msg.transferId.startsWith('bench-')) {
+          const benchLink = this.benchRecvLinks.get(msg.transferId);
+          if (benchLink && benchLink.ctrl.readyState === 'open') {
+            benchLink.lastSink = msg.sink;
+            this.sendControl(benchLink, { t: 'bench-ready', id: msg.transferId, window: msg.window, sink: msg.sink });
+          }
+          return;
+        }
         const rec = this.transfers.get(msg.transferId);
         if (!rec || rec.direction !== 'receive') return;
+        rec.sink = msg.sink;
         const link = this.links.get(rec.peerId);
         if (link && link.ctrl.readyState === 'open') {
-          this.sendControl(link, { t: 'accept', id: msg.transferId });
+          link.lastSink = msg.sink;
+          this.sendControl(link, { t: 'accept', id: msg.transferId, window: msg.window, sink: msg.sink });
+        }
+        this.emitTransfers();
+        this.emitHud();
+        break;
+      }
+      case 'credit-out': {
+        const rec = this.transfers.get(msg.transferId);
+        if (rec) {
+          const link = this.links.get(rec.peerId);
+          if (link) this.sendControl(link, { t: 'credit', id: msg.transferId, bytes: msg.bytes });
+          return;
+        }
+        const benchLink = this.benchRecvLinks.get(msg.transferId);
+        if (benchLink && benchLink.ctrl.readyState === 'open') {
+          this.sendControl(benchLink, { t: 'credit', id: msg.transferId, bytes: msg.bytes });
         }
         break;
       }
       case 'recv-progress': {
+        if (msg.transferId.startsWith('bench-')) {
+          const benchLink = this.benchRecvLinks.get(msg.transferId);
+          if (benchLink) {
+            benchLink.receiverPendingBytes = msg.pendingWriteBytes;
+            benchLink.lastSink = msg.sink;
+          }
+          this.emitHud();
+          return;
+        }
         const rec = this.transfers.get(msg.transferId);
         if (!rec || rec.status === 'paused' || rec.status === 'cancelled' || rec.status === 'failed') return;
+        const link = this.links.get(rec.peerId);
+        if (link) {
+          link.receiverPendingBytes = msg.pendingWriteBytes;
+          link.lastSink = msg.sink;
+        }
+        rec.sink = msg.sink;
         rec.bytesTransferred = msg.rawBytes;
         rec.wireBytesTransferred = msg.wireBytes;
         this.updateThroughputAndRatio(rec);
@@ -1133,20 +1944,57 @@ export class WarpWebRTCEngine {
         if (!rec) return;
         if (!msg.savedToHandle && msg.file) {
           triggerDownload(msg.file, rec.fileName);
-          // Release OPFS staging file after the browser has latched onto the blob download.
           setTimeout(() => this.postWorker({ type: 'release', transferId: msg.transferId }), 90_000);
         }
         rec.bytesTransferred = rec.fileSize;
+        rec.sink = msg.sink;
+        rec.finalizeMs = Math.round(msg.finalizeMs);
+        rec.integrityVerified = true;
         rec.status = 'completed';
         rec.throughputMBps = null;
+        rec.wireThroughputMBps = null;
         rec.etaSeconds = 0;
         rec.completedAt = Date.now();
         this.speedHistory.delete(rec.id);
         const link = this.links.get(rec.peerId);
-        if (link && link.ctrl.readyState === 'open') {
-          this.sendControl(link, { t: 'complete', id: rec.id });
+        if (link) {
+          link.receiverPendingBytes = 0;
+          if (link.ctrl.readyState === 'open') {
+            this.sendControl(link, {
+              t: 'complete',
+              id: rec.id,
+              hash: msg.hash,
+              sink: msg.sink,
+              writeMs: msg.writeMs,
+              finalizeMs: msg.finalizeMs,
+            });
+          }
         }
         this.emitTransfers();
+        this.emitHud();
+        break;
+      }
+      case 'bench-done': {
+        const benchLink = this.benchRecvLinks.get(msg.transferId);
+        this.benchRecvLinks.delete(msg.transferId);
+        if (benchLink) {
+          benchLink.receiverPendingBytes = 0;
+          if (benchLink.ctrl.readyState === 'open') {
+            this.sendControl(benchLink, {
+              t: 'bench-result',
+              id: msg.transferId,
+              bytes: msg.bytes,
+              wireBytes: msg.wireBytes,
+              elapsedMs: msg.elapsedMs,
+              writeMs: msg.writeMs,
+              finalizeMs: msg.finalizeMs,
+              maxPendingWriteBytes: msg.maxPendingWriteBytes,
+              sink: msg.sink,
+              hash: msg.hash,
+              complete: msg.complete,
+            });
+          }
+        }
         this.emitHud();
         break;
       }
@@ -1157,11 +2005,26 @@ export class WarpWebRTCEngine {
           analysisWaiter.reject(new Error(msg.message));
           return;
         }
+        const bench = this.benchSenders.get(msg.transferId);
+        if (bench) {
+          bench.readyReject?.(new Error(msg.message));
+          bench.doneReject?.(new Error(msg.message));
+          return;
+        }
+        if (msg.transferId.startsWith('bench-')) {
+          const benchLink = this.benchRecvLinks.get(msg.transferId);
+          this.benchRecvLinks.delete(msg.transferId);
+          if (benchLink) {
+            this.sendControl(benchLink, { t: 'failed', id: msg.transferId, reason: msg.message });
+          }
+          return;
+        }
         const rec = this.transfers.get(msg.transferId);
         if (!rec) return;
         rec.status = 'failed';
         rec.errorMessage = msg.message;
         rec.throughputMBps = null;
+        rec.wireThroughputMBps = null;
         rec.etaSeconds = null;
         this.sourceFiles.delete(rec.id);
         this.speedHistory.delete(rec.id);
@@ -1177,7 +2040,9 @@ export class WarpWebRTCEngine {
         const link = this.linkById.get(msg.linkId);
         if (!link) return;
         link.buffered = msg.buffered;
+        link.channelLaneIds = msg.lanes;
         link.activeChannels = msg.active;
+        link.highWatermark = msg.highWatermark;
         this.emitHud();
         break;
       }
@@ -1185,14 +2050,25 @@ export class WarpWebRTCEngine {
   };
 
   private tryFinalizeSend(transferId: string): void {
-    if (!this.sendDrainedSet.has(transferId) || !this.remoteCompletedSet.has(transferId)) return;
-    this.sendDrainedSet.delete(transferId);
-    this.remoteCompletedSet.delete(transferId);
+    const senderHash = this.sendDrainedHashes.get(transferId);
+    const remoteInfo = this.remoteCompletedInfo.get(transferId);
+    if (senderHash === undefined || !remoteInfo) return;
+    this.sendDrainedHashes.delete(transferId);
+    this.remoteCompletedInfo.delete(transferId);
     const rec = this.transfers.get(transferId);
     if (!rec) return;
     rec.bytesTransferred = rec.fileSize;
-    rec.status = 'completed';
+    if (remoteInfo.sink) rec.sink = remoteInfo.sink;
+    if (remoteInfo.finalizeMs !== undefined) rec.finalizeMs = Math.round(remoteInfo.finalizeMs);
+    rec.integrityVerified = remoteInfo.hash ? remoteInfo.hash === senderHash : true;
+    if (rec.integrityVerified === false) {
+      rec.status = 'failed';
+      rec.errorMessage = 'Integrity hash mismatch after transfer';
+    } else {
+      rec.status = 'completed';
+    }
     rec.throughputMBps = null;
+    rec.wireThroughputMBps = null;
     rec.etaSeconds = 0;
     rec.completedAt = Date.now();
     this.sourceFiles.delete(transferId);
@@ -1204,7 +2080,7 @@ export class WarpWebRTCEngine {
   private updateThroughputAndRatio(rec: TransferRecord): void {
     const now = performance.now();
     const samples = this.speedHistory.get(rec.id) ?? [];
-    samples.push({ t: now, bytes: rec.bytesTransferred });
+    samples.push({ t: now, bytes: rec.bytesTransferred, wireBytes: rec.wireBytesTransferred });
     const windowStart = now - 1_400;
     while (samples.length > 2 && samples[0].t < windowStart) samples.shift();
     this.speedHistory.set(rec.id, samples);
@@ -1213,15 +2089,18 @@ export class WarpWebRTCEngine {
       const first = samples[0];
       const dtSec = (now - first.t) / 1000;
       const dBytes = rec.bytesTransferred - first.bytes;
+      const dWire = rec.wireBytesTransferred - first.wireBytes;
       if (dtSec >= 0.08 && dBytes >= 0) {
         const mbps = dBytes / (1024 * 1024) / dtSec;
+        const wireMbps = Math.max(0, dWire) / (1024 * 1024) / dtSec;
         rec.throughputMBps = Math.round(mbps * 10) / 10;
+        rec.wireThroughputMBps = Math.round(wireMbps * 10) / 10;
         const remainingMB = Math.max(0, rec.fileSize - rec.bytesTransferred) / (1024 * 1024);
         rec.etaSeconds = mbps > 0.05 ? Math.max(1, Math.ceil(remainingMB / mbps)) : null;
       }
     }
 
-    if (rec.compressed && rec.wireBytesTransferred > 0 && rec.bytesTransferred > 0) {
+    if (rec.wireBytesTransferred > 0 && rec.bytesTransferred > 0) {
       rec.compressionRatio = Math.round((rec.bytesTransferred / rec.wireBytesTransferred) * 100) / 100;
     }
   }
@@ -1229,11 +2108,47 @@ export class WarpWebRTCEngine {
   private syncActiveTransferRoute(link: PeerLink): void {
     const rtt = link.telemetry.rttMs ?? link.pingRttMs;
     for (const rec of this.transfers.values()) {
-      if (rec.peerId === link.peerId && (rec.status === 'transferring' || rec.status === 'offering' || rec.status === 'offered')) {
+      if (
+        rec.peerId === link.peerId &&
+        (rec.status === 'transferring' || rec.status === 'offering' || rec.status === 'offered')
+      ) {
         rec.route = link.telemetry.route;
+        rec.candidatePairLabel = link.telemetry.candidatePairLabel;
         rec.rttMs = rtt;
       }
     }
+  }
+
+  private async sumAllLanesStats(link: PeerLink): Promise<{
+    primary: LinkTelemetrySnapshot;
+    bytesSent: number;
+    bytesReceived: number;
+  }> {
+    const primary = await link.cascade.refreshTelemetry();
+    let bytesSent = primary.bytesSent;
+    let bytesReceived = primary.bytesReceived;
+    for (const lane of link.extraLanes.values()) {
+      if (lane.closed || lane.pc.connectionState !== 'connected') continue;
+      const snap = await sampleLinkTelemetry(lane.pc);
+      bytesSent += snap.bytesSent;
+      bytesReceived += snap.bytesReceived;
+    }
+    return { primary, bytesSent, bytesReceived };
+  }
+
+  private async refreshLinkStats(link: PeerLink): Promise<void> {
+    const { primary, bytesSent, bytesReceived } = await this.sumAllLanesStats(link);
+    link.telemetry = primary;
+    const now = performance.now();
+    const totalBytes = bytesSent + bytesReceived;
+    if (link.lastStatsSample) {
+      const dtSec = (now - link.lastStatsSample.t) / 1000;
+      if (dtSec >= 0.15) {
+        const delta = Math.max(0, totalBytes - link.lastStatsSample.totalBytes);
+        link.statsWireMBps = Math.round((delta / (1024 * 1024) / dtSec) * 10) / 10;
+      }
+    }
+    link.lastStatsSample = { t: now, totalBytes };
   }
 
   private async tickTelemetry(): Promise<void> {
@@ -1242,25 +2157,31 @@ export class WarpWebRTCEngine {
       if (link.ctrl.readyState === 'open') {
         this.sendControl(link, { t: 'ping', ts: performance.now() });
       }
-      const snap = await link.cascade.refreshTelemetry();
-      link.telemetry = snap;
+      await this.refreshLinkStats(link);
+
       if (link.bridgePool) {
         link.buffered = link.bridgePool.bufferedAmounts;
-        link.activeChannels = link.bridgePool.activeCount;
+        link.channelLaneIds = link.bridgePool.channelLaneIds;
+        link.activeChannels = link.bridgePool.activeChannelCount;
+        this.postWorker({
+          type: 'bridge-stats',
+          linkId: link.linkId,
+          sentBytes: link.bridgePool.sentBytes,
+          buffered: link.buffered,
+          openLanes: link.bridgePool.openLaneCount,
+        });
       }
-      const rtt = snap.rttMs ?? link.pingRttMs ?? 0;
-      const maxSctp = link.pc.sctp?.maxMessageSize ?? DEFAULT_CHUNK + 1024;
-      const activeSend = [...this.transfers.values()].find(
-        (t) => t.peerId === link.peerId && t.direction === 'send' && t.status === 'transferring',
-      );
-      const baseChunk = negotiateChunkSize(maxSctp, activeSend?.compressed ?? false, MAX_CHUNK, MIN_CHUNK);
-      const effectiveChunk = rtt > DEGRADED_RTT_MS ? Math.min(baseChunk, DEGRADED_CHUNK) : baseChunk;
-      if (link.bridgePool) {
-        link.bridgePool.setActiveCount(rtt > DEGRADED_RTT_MS ? DEGRADED_CHANNELS : CHANNEL_COUNT);
-      }
-      this.postWorker({ type: 'net', linkId: link.linkId, rttMs: rtt, chunkSize: effectiveChunk });
+
+      const rtt = link.telemetry.rttMs ?? link.pingRttMs ?? 1;
+      const maxSctp = link.pc.sctp?.maxMessageSize ?? MAX_CHUNK + 64;
+      this.postWorker({ type: 'net', linkId: link.linkId, rttMs: rtt, maxMessageSize: maxSctp });
       this.syncActiveTransferRoute(link);
-      this.callbacks.onPeerLinkState?.(link.peerId, link.pc.connectionState, snap.route, snap.rttMs ?? link.pingRttMs);
+      this.callbacks.onPeerLinkState?.(
+        link.peerId,
+        link.pc.connectionState,
+        link.telemetry.route,
+        link.telemetry.rttMs ?? link.pingRttMs,
+      );
     }
     this.emitHud();
   }
@@ -1273,28 +2194,55 @@ export class WarpWebRTCEngine {
     const activeTransfer = [...this.transfers.values()].find(
       (t) => t.status === 'transferring' || t.status === 'flushing',
     );
-    const targetPeerId = activeTransfer?.peerId ?? this.focusedPeerId ?? this.links.keys().next().value ?? null;
-    const link = targetPeerId ? this.links.get(targetPeerId) ?? null : null;
+    const targetPeerId =
+      activeTransfer?.peerId ?? this.focusedPeerId ?? this.links.keys().next().value ?? null;
+    const link = targetPeerId ? (this.links.get(targetPeerId) ?? null) : null;
     const rttMs = link ? (link.telemetry.rttMs ?? link.pingRttMs) : null;
+    const connectedExtra = link
+      ? [...link.extraLanes.values()].filter((l) => !l.closed && l.pc.connectionState === 'connected').length
+      : 0;
+    const connectedLanes = link && link.pc.connectionState === 'connected' ? 1 + connectedExtra : 0;
+    const tuner = link?.lastTuner ?? null;
+    const highWm = link?.highWatermark ?? INITIAL_HIGH_WATERMARK;
+
+    const appMBps =
+      activeTransfer?.throughputMBps ??
+      (tuner && this.benchSenders.size > 0 ? Math.round((tuner.drainBps / (1024 * 1024)) * 10) / 10 : 0);
 
     const hud: TelemetryHUDState = {
       activeLinkPeerId: link?.peerId ?? null,
       peerName: link?.peerName ?? null,
       connectionState: link ? link.pc.connectionState : 'idle',
       route: link?.telemetry.route ?? 'unknown',
+      candidatePairLabel: link?.telemetry.candidatePairLabel ?? 'standby',
       protocol: link?.telemetry.protocol ?? null,
       rttMs,
-      throughputMBps: activeTransfer?.throughputMBps ?? 0,
+      throughputMBps: appMBps,
+      wireThroughputMBps: activeTransfer?.wireThroughputMBps ?? appMBps,
+      statsWireMBps: link?.statsWireMBps ?? 0,
       compressionRatio: activeTransfer?.compressionRatio ?? null,
-      compressed: activeTransfer?.compressed ?? false,
-      chunkSize: activeTransfer?.chunkSize ?? (link?.pc.sctp?.maxMessageSize ? Math.min(MAX_CHUNK, link.pc.sctp.maxMessageSize) : DEFAULT_CHUNK),
+      compressed: activeTransfer?.compressed ?? Boolean(tuner?.lz4),
+      chunkSize:
+        activeTransfer?.chunkSize ??
+        tuner?.chunk ??
+        (link?.pc.sctp?.maxMessageSize ? Math.min(MAX_CHUNK, link.pc.sctp.maxMessageSize) : DEFAULT_CHUNK),
       maxSctpMessageSize: link?.pc.sctp?.maxMessageSize ?? null,
       activeChannels: activeTransfer?.activeChannels ?? link?.activeChannels ?? CHANNEL_COUNT,
+      activeLanes: activeTransfer?.activeLanes ?? tuner?.lanes ?? Math.max(1, connectedLanes),
+      connectedLanes,
+      highWatermark: highWm,
+      lowWatermark: link?.lowWatermark ?? lowWatermarkFor(highWm, CHANNEL_COUNT),
       channelBufferedBytes: link?.buffered ?? [0, 0, 0, 0],
-      workerMode: link?.nativeWorkerChannels ? 'native-worker-dc' : 'zero-copy-bridge',
+      channelLaneIds: link?.channelLaneIds ?? ['0', '0', '0', '0'],
+      workerMode: link?.nativeWorkerChannels ? 'native-worker-dc' : 'transferable-bridge',
+      sink: activeTransfer?.sink ?? link?.lastSink ?? null,
+      receiverPendingBytes: link?.receiverPendingBytes ?? 0,
+      tuner,
       lz4Ready: this.lz4Ready,
       opfsReady: this.opfsReady,
-      degraded: rttMs !== null && rttMs > DEGRADED_RTT_MS,
+      opfsSyncReady: this.opfsSyncReady,
+      secureContext: this.secureContext,
+      degraded: link?.telemetry.route === 'relay',
     };
     this.callbacks.onTelemetryChange(hud);
   }

@@ -1,5 +1,6 @@
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
+import basicSsl from '@vitejs/plugin-basic-ssl';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -31,10 +32,11 @@ function extensionAssets(): Plugin {
 
 export default defineConfig(({ mode }) => {
   const isExtension = mode === 'extension';
+  const useHttps = mode === 'https' || process.env.VITE_HTTPS === '1';
   return {
     // Relative base works for GitHub Pages sub-paths, Vercel roots and chrome-extension:// origins alike.
     base: './',
-    plugins: [react(), isExtension ? extensionAssets() : null],
+    plugins: [react(), useHttps ? basicSsl() : null, isExtension ? extensionAssets() : null],
     define: {
       __BUILD_TARGET__: JSON.stringify(isExtension ? 'extension' : 'web'),
     },
@@ -49,7 +51,7 @@ export default defineConfig(({ mode }) => {
       // MV3 forbids inline scripts; the module preload polyfill is unnecessary in Chromium anyway.
       modulePreload: { polyfill: !isExtension },
       assetsInlineLimit: (file) => (file.endsWith('.wasm') ? false : undefined),
-      chunkSizeWarningLimit: 900,
+      chunkSizeWarningLimit: 1100,
     },
     server: {
       port: 5173,

@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { BenchmarkModal } from './components/BenchmarkModal';
 import { EngineerHUD } from './components/EngineerHUD';
 import { GlassCard } from './components/GlassCard';
 import { PairingSheet } from './components/PairingSheet';
 import { Radar } from './components/Radar';
 import { TransferQueue } from './components/TransferQueue';
 import { loadCustomTurnServers, saveCustomTurnServers } from './engine/iceCascade';
-import { CHANNEL_COUNT, DEFAULT_CHUNK } from './engine/protocol';
+import { CHANNEL_COUNT, DEFAULT_CHUNK, INITIAL_HIGH_WATERMARK, LOW_WATERMARK } from './engine/protocol';
 import {
   detectDeviceKind,
   detectExtensionSidePanel,
@@ -26,18 +27,31 @@ const INITIAL_HUD: TelemetryHUDState = {
   peerName: null,
   connectionState: 'idle',
   route: 'unknown',
+  candidatePairLabel: 'standby',
   protocol: null,
   rttMs: null,
   throughputMBps: 0,
+  wireThroughputMBps: 0,
+  statsWireMBps: 0,
   compressionRatio: null,
   compressed: false,
   chunkSize: DEFAULT_CHUNK,
   maxSctpMessageSize: null,
   activeChannels: CHANNEL_COUNT,
+  activeLanes: 1,
+  connectedLanes: 0,
+  highWatermark: INITIAL_HIGH_WATERMARK,
+  lowWatermark: LOW_WATERMARK,
   channelBufferedBytes: [0, 0, 0, 0],
-  workerMode: 'zero-copy-bridge',
+  channelLaneIds: ['0', '0', '0', '0'],
+  workerMode: 'transferable-bridge',
+  sink: null,
+  receiverPendingBytes: 0,
+  tuner: null,
   lz4Ready: false,
   opfsReady: false,
+  opfsSyncReady: false,
+  secureContext: typeof window !== 'undefined' ? Boolean(window.isSecureContext) : true,
   degraded: false,
 };
 
@@ -77,6 +91,8 @@ export const App: React.FC = () => {
   const [selectedPeerId, setSelectedPeerId] = useState<string | null>(null);
   const [showPairingDesktop, setShowPairingDesktop] = useState<boolean>(false);
   const [showSettingsDesktop, setShowSettingsDesktop] = useState<boolean>(false);
+  const [showBenchmark, setShowBenchmark] = useState<boolean>(false);
+  const [httpWarningDismissed, setHttpWarningDismissed] = useState<boolean>(false);
   const [compactTab, setCompactTab] = useState<CompactSection>('radar');
   const [liveAnnouncement, setLiveAnnouncement] = useState<string>('');
   const [roomBanner, setRoomBanner] = useState<{
@@ -387,6 +403,13 @@ export const App: React.FC = () => {
             </button>
             <button
               type="button"
+              onClick={() => setShowBenchmark(true)}
+              className="warp-btn warp-btn-subtle rounded-full border border-white/16 bg-white/[0.05] px-3.5 py-1.5 text-xs font-medium text-ink-primary"
+            >
+              Speed Test
+            </button>
+            <button
+              type="button"
               onClick={() => {
                 setShowSettingsDesktop((v) => !v);
                 setShowPairingDesktop(false);
@@ -402,11 +425,43 @@ export const App: React.FC = () => {
             </button>
           </nav>
         ) : (
-          <span className="truncate rounded-full border border-white/12 bg-white/[0.04] px-2.5 py-1 text-[11px] text-ink-secondary">
-            {deviceName}
-          </span>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setShowBenchmark(true)}
+              className="warp-btn rounded-full border border-cyan-ice/35 bg-cyan-warp/15 px-2.5 py-1 text-[11px] font-medium text-cyan-ice"
+            >
+              Speed Test
+            </button>
+            <span className="max-w-[110px] truncate rounded-full border border-white/12 bg-white/[0.04] px-2.5 py-1 text-[11px] text-ink-secondary">
+              {deviceName}
+            </span>
+          </div>
         )}
       </header>
+
+      {/* Plain-HTTP Insecure Origin Warning (explains OPFS RAM limit on http://192.168.x.x) */}
+      {!hud.secureContext && !httpWarningDismissed && (
+        <div
+          role="status"
+          className="z-20 mx-auto mt-2.5 flex w-full max-w-[1360px] px-4 sm:px-6"
+        >
+          <div className="flex w-full flex-wrap items-center justify-between gap-2 rounded-2xl border border-amber-system/40 bg-amber-system/[0.11] px-3.5 py-2 text-xs text-amber-system backdrop-blur-md">
+            <span>
+              <strong>Plain HTTP Origin:</strong> Browsers disable zero-RAM OPFS disk streaming on insecure LAN URLs. For
+              multi-GB transfers at full speed, run <code className="text-white">npm run dev:https</code> or open the
+              HTTPS GitHub Pages deployment.
+            </span>
+            <button
+              type="button"
+              onClick={() => setHttpWarningDismissed(true)}
+              className="warp-btn rounded-full border border-amber-system/40 px-2.5 py-0.5 text-[11px] font-medium text-amber-system hover:text-white"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Compact Chrome Sidebar / Mobile Segmented Navigation */}
       {compact && (
@@ -491,6 +546,16 @@ export const App: React.FC = () => {
                       className="warp-btn warp-btn-primary rounded-full bg-cyan-warp px-3 py-1 text-[11px] font-semibold text-white"
                     >
                       Send File to {primaryJoined.name}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedPeerId(primaryJoined.id);
+                        setShowBenchmark(true);
+                      }}
+                      className="warp-btn rounded-full border border-cyan-ice/35 bg-cyan-warp/18 px-2.5 py-1 text-[11px] font-medium text-cyan-ice hover:text-white"
+                    >
+                      Speed Test
                     </button>
                     <button
                       type="button"
@@ -716,8 +781,23 @@ export const App: React.FC = () => {
 
       {/* Bottom Dynamic Island Engineer HUD */}
       <footer className="mx-auto w-full max-w-[1360px] px-4 pb-3.5 sm:px-6">
-        <EngineerHUD hud={hud} compact={compact} />
+        <EngineerHUD hud={hud} compact={compact} onOpenBenchmark={() => setShowBenchmark(true)} />
       </footer>
+
+      {/* Repeatable Diagnostics & Autotune Benchmark Modal */}
+      <BenchmarkModal
+        open={showBenchmark}
+        peers={peers}
+        selectedPeerId={selectedPeerId}
+        hud={hud}
+        compact={compact}
+        onClose={() => setShowBenchmark(false)}
+        onRunSuite={(peerId, peerName, preset, meta, onProgress) => {
+          if (!engineRef.current) return Promise.reject(new Error('Engine not initialized'));
+          return engineRef.current.runBenchmarkSuite(peerId, peerName, preset, meta, onProgress);
+        }}
+        onCancelSuite={() => engineRef.current?.cancelBenchmarks()}
+      />
     </div>
   );
 };

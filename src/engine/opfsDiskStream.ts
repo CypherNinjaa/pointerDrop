@@ -8,18 +8,16 @@
  *   so chunks arriving out of order over the unordered channels land exactly
  *   where they belong and nothing accumulates in the JS heap — 20 GB is fine.
  *
- *   When the user chose a destination with showSaveFilePicker(), the finished
- *   OPFS file is streamed into that handle (disk → disk) and the OPFS copy is
- *   removed. Otherwise the disk-backed OPFS File is handed to the UI thread,
- *   which triggers a regular download anchor (OPFS Virtual Accumulation Sink).
- *
  *   Browsers without sync access handles fall back to an async OPFS writable
- *   (positioned writes), and as a last resort to an in-memory sparse sink.
+ *   (positioned writes bounded by explicit application-level receiver credits),
+ *   and only for small files under a strict memory budget to an in-memory sink.
  */
+
+import { formatBytes, type SinkKind } from './protocol';
 
 const INBOX_DIR = 'warp-inbox';
 
-export type SinkKind = 'opfs-sync' | 'opfs-writable' | 'memory';
+export type { SinkKind };
 
 export interface DiskSink {
   readonly kind: SinkKind;
@@ -48,6 +46,30 @@ async function inboxDir(): Promise<FileSystemDirectoryHandle> {
 
 export function opfsSupported(): boolean {
   return typeof navigator !== 'undefined' && !!navigator.storage && typeof navigator.storage.getDirectory === 'function';
+}
+
+/** Probes whether OPFS + FileSystemSyncAccessHandle actually work in this Worker context. */
+export async function probeOpfsCapability(): Promise<{ opfs: boolean; opfsSync: boolean }> {
+  if (!opfsSupported()) return { opfs: false, opfsSync: false };
+  const probeName = '__warp_probe__.tmp';
+  try {
+    const dir = await inboxDir();
+    const fh = (await dir.getFileHandle(probeName, { create: true })) as SyncCapableFileHandle;
+    let opfsSync = false;
+    if (typeof fh.createSyncAccessHandle === 'function') {
+      try {
+        const sh = await fh.createSyncAccessHandle();
+        sh.close();
+        opfsSync = true;
+      } catch {
+        opfsSync = false;
+      }
+    }
+    await dir.removeEntry(probeName).catch(() => undefined);
+    return { opfs: true, opfsSync };
+  } catch {
+    return { opfs: false, opfsSync: false };
+  }
 }
 
 /** Removes leftover partial files from previous sessions (called once at worker boot). */
@@ -135,7 +157,7 @@ class OpfsWritableSink implements DiskSink {
   }
 }
 
-/** Sparse in-memory sink used only where OPFS is entirely unavailable. */
+/** Bounded in-memory sink used only for small files when OPFS is unavailable. */
 class MemorySink implements DiskSink {
   readonly kind = 'memory' as const;
   readonly synchronous = true;
@@ -165,25 +187,85 @@ class MemorySink implements DiskSink {
   }
 }
 
-export async function openDiskSink(transferId: string, displayName: string, _size: number, mime = 'application/octet-stream'): Promise<DiskSink> {
-  if (opfsSupported()) {
+/** Benchmark sink: counts bytes and discards them, so a speed test measures the network path only. */
+export class DiscardSink implements DiskSink {
+  readonly kind = 'discard' as const;
+  readonly synchronous = true;
+  write(): void {
+    // Intentionally discarded.
+  }
+  async finalize(): Promise<File> {
+    return new File([], 'benchmark.bin');
+  }
+  async abort(): Promise<void> {
+    // Nothing to release.
+  }
+}
+
+export interface OpenDiskSinkOptions {
+  mime?: string;
+  preferredSink?: 'auto' | SinkKind;
+  maxMemoryBytes?: number;
+}
+
+export async function openDiskSink(
+  transferId: string,
+  displayName: string,
+  size: number,
+  options: OpenDiskSinkOptions = {},
+): Promise<DiskSink> {
+  const { mime = 'application/octet-stream', preferredSink = 'auto', maxMemoryBytes = 384 * 1024 * 1024 } = options;
+
+  if (preferredSink === 'discard') {
+    return new DiscardSink();
+  }
+
+  if (preferredSink !== 'memory' && opfsSupported()) {
     const name = `${transferId}.part`;
     try {
       const dir = await inboxDir();
       const fileHandle = (await dir.getFileHandle(name, { create: true })) as SyncCapableFileHandle;
-      if (typeof fileHandle.createSyncAccessHandle === 'function') {
+      if (
+        (preferredSink === 'auto' || preferredSink === 'opfs-sync') &&
+        typeof fileHandle.createSyncAccessHandle === 'function'
+      ) {
         const handle = await fileHandle.createSyncAccessHandle();
-        handle.truncate(0); // Reset any stale file immediately without blocking on multi-GB zero-fill.
+        handle.truncate(0);
         return new OpfsSyncSink(fileHandle, handle, name);
+      }
+      if (preferredSink === 'opfs-sync') {
+        await dir.removeEntry(name).catch(() => undefined);
+        throw new Error('OPFS FileSystemSyncAccessHandle is not supported on this browser');
       }
       if (typeof fileHandle.createWritable === 'function') {
         const writable = await fileHandle.createWritable({ keepExistingData: false });
         return new OpfsWritableSink(fileHandle, writable, name);
       }
     } catch (error) {
-      console.warn('[warp] OPFS unavailable, falling back to memory sink', error);
+      if (preferredSink === 'opfs-sync' || preferredSink === 'opfs-writable') {
+        throw error;
+      }
+      console.warn('[warp] OPFS unavailable, checking memory sink budget', error);
     }
+  } else if (preferredSink === 'opfs-sync' || preferredSink === 'opfs-writable') {
+    const secure = typeof self !== 'undefined' && (self as unknown as { isSecureContext?: boolean }).isSecureContext;
+    throw new Error(
+      secure
+        ? `Requested ${preferredSink} is unavailable in this browser/mode`
+        : `OPFS requires HTTPS or localhost (current origin is insecure HTTP)`,
+    );
   }
+
+  if (Number.isFinite(size) && size > maxMemoryBytes) {
+    const secure = typeof self !== 'undefined' && (self as unknown as { isSecureContext?: boolean }).isSecureContext;
+    const why = secure
+      ? 'browser storage is restricted (e.g. private/incognito mode)'
+      : 'page was opened over plain HTTP instead of HTTPS/localhost';
+    throw new Error(
+      `OPFS disk streaming unavailable (${why}). Refusing to buffer ${formatBytes(size)} in RAM (safe cap ${formatBytes(maxMemoryBytes)}). Use HTTPS or select a save file on a supported desktop browser.`,
+    );
+  }
+
   return new MemorySink(displayName, mime);
 }
 
@@ -208,7 +290,6 @@ export async function chooseSaveTarget(suggestedName: string): Promise<SaveTarge
     return { kind: 'handle', handle };
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') return { kind: 'cancelled' };
-    // SecurityError (e.g. cross-origin iframe) → automatic download fallback.
     return { kind: 'download' };
   }
 }
@@ -223,7 +304,6 @@ export function triggerDownload(file: File, name: string): void {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  // Give the browser time to start reading the disk-backed blob before revoking.
   setTimeout(() => URL.revokeObjectURL(url), 120_000);
 }
 

@@ -3,9 +3,9 @@ import type { IceRoute } from './protocol';
 /**
  * 3-Tier ICE Cascade & NAT Traversal Adjudicator
  *
- * Tier 1 — `typ host`:  Direct LAN UDP over shared Wi-Fi / Ethernet subnet (< 2 ms).
- * Tier 2 — `typ srflx`: Public STUN reflection + bidirectional UDP hole-punching.
- * Tier 3 — `typ relay`: DTLS-encrypted TURN packet relay for Symmetric CGNAT / strict firewalls.
+ * Tier 1 — `typ host`:  Direct LAN UDP over shared Wi-Fi / Ethernet (`host ↔ host`).
+ * Tier 2 — `typ srflx`: Reflexive NAT / STUN hole-punching (`srflx` / `prflx`).
+ * Tier 3 — `typ relay`: DTLS-encrypted TURN packet relay (`relay`).
  */
 
 export const CASCADE_RESTART_DELAY_MS = 800;
@@ -22,7 +22,7 @@ export const STUN_SERVERS: RTCIceServer[] = [
 ];
 
 /**
- * Default open community TURN relays (end-to-end DTLS-SRTP/SCTP remains encrypted
+ * Default open community TURN relays (end-to-end DTLS-SCTP remains encrypted
  * between the two browsers; the relay only forwards opaque UDP/TCP datagrams).
  * Users can override or supplement these in Settings with private TURN servers.
  */
@@ -90,7 +90,7 @@ export function buildRtcConfig(stage: CascadeStage = 'all', extraTurn: RTCIceSer
     };
   }
   // Tier 1 + Tier 2 initial handshake: avoid pre-pooling public TURN servers so
-  // direct LAN (`typ host`) and direct STUN (`typ srflx`) always win nomination first.
+  // direct LAN (`typ host`) and direct STUN (`typ srflx`) win nomination first.
   return {
     iceServers: [...STUN_SERVERS, ...custom, ...extraTurn],
     iceTransportPolicy: 'all',
@@ -103,54 +103,85 @@ export interface LinkTelemetrySnapshot {
   route: IceRoute;
   localCandidateType: string | null;
   remoteCandidateType: string | null;
+  candidatePairLabel: string;
   protocol: string | null;
+  relayProtocol: string | null;
   rttMs: number | null;
   availableOutgoingBitrate: number | null;
+  bytesSent: number;
+  bytesReceived: number;
+  dataChannelBytesSent: number;
+  dataChannelBytesReceived: number;
+  dataChannelMessagesSent: number;
+  dataChannelMessagesReceived: number;
+  timestamp: number;
 }
 
-function classifyCandidatePair(
-  localType: string | null,
-  remoteType: string | null,
-  rttMs: number | null,
-): IceRoute {
+export function emptyTelemetrySnapshot(): LinkTelemetrySnapshot {
+  return {
+    route: 'unknown',
+    localCandidateType: null,
+    remoteCandidateType: null,
+    candidatePairLabel: 'standby',
+    protocol: null,
+    relayProtocol: null,
+    rttMs: null,
+    availableOutgoingBitrate: null,
+    bytesSent: 0,
+    bytesReceived: 0,
+    dataChannelBytesSent: 0,
+    dataChannelBytesReceived: 0,
+    dataChannelMessagesSent: 0,
+    dataChannelMessagesReceived: 0,
+    timestamp: performance.now(),
+  };
+}
+
+/**
+ * Strictly classifies an ICE candidate pair from its candidate types only — never
+ * inferring `host` from low RTT alone.
+ */
+export function classifyCandidatePair(localType: string | null, remoteType: string | null): IceRoute {
   if (!localType && !remoteType) return 'unknown';
   if (localType === 'relay' || remoteType === 'relay') return 'relay';
-  if (localType === 'host' && (!remoteType || remoteType === 'host')) return 'host';
-  // On Android <-> Windows over shared Wi-Fi, mDNS (.local) obfuscation often causes
-  // direct LAN packets from a `host` socket to be classified as `prflx` with <12 ms RTT.
-  if (
-    ((localType === 'host' && remoteType === 'prflx') || (localType === 'prflx' && remoteType === 'host')) &&
-    rttMs !== null &&
-    rttMs <= 12
-  ) {
-    return 'host';
-  }
+  if (localType === 'host' && remoteType === 'host') return 'host';
   if (localType === 'srflx' || localType === 'prflx' || remoteType === 'srflx' || remoteType === 'prflx') {
     return 'srflx';
   }
   return 'unknown';
 }
 
+export function formatCandidatePairLabel(
+  localType: string | null,
+  remoteType: string | null,
+  protocol: string | null,
+  relayProtocol: string | null,
+): string {
+  if (!localType && !remoteType) return 'standby';
+  const l = localType ?? '?';
+  const r = remoteType ?? '?';
+  const proto = relayProtocol ? `${protocol ?? 'udp'}/${relayProtocol}` : (protocol ?? 'udp');
+  return `${l} ↔ ${r} · ${proto}`;
+}
+
 /**
- * Queries standard WebRTC `RTCPeerConnection.getStats()` to determine the genuinely
- * active ICE candidate pair, route tier (`host` | `srflx` | `relay`), and live RTT.
+ * Queries standard WebRTC `RTCPeerConnection.getStats()` to extract exact ICE
+ * candidate-pair evidence, transport byte counters, RTT, and data-channel counters.
  */
 export async function sampleLinkTelemetry(pc: RTCPeerConnection): Promise<LinkTelemetrySnapshot> {
   if (pc.connectionState === 'closed') {
-    return {
-      route: 'unknown',
-      localCandidateType: null,
-      remoteCandidateType: null,
-      protocol: null,
-      rttMs: null,
-      availableOutgoingBitrate: null,
-    };
+    return emptyTelemetrySnapshot();
   }
 
+  const now = performance.now();
   const report = await pc.getStats();
   let selectedPairId: string | null = null;
   const pairs: Array<Record<string, unknown>> = [];
   const candidates = new Map<string, Record<string, unknown>>();
+  let dcBytesSent = 0;
+  let dcBytesReceived = 0;
+  let dcMsgSent = 0;
+  let dcMsgReceived = 0;
 
   report.forEach((stat: Record<string, unknown>) => {
     if (stat.type === 'transport' && typeof stat.selectedCandidatePairId === 'string') {
@@ -159,6 +190,11 @@ export async function sampleLinkTelemetry(pc: RTCPeerConnection): Promise<LinkTe
       pairs.push(stat);
     } else if (stat.type === 'local-candidate' || stat.type === 'remote-candidate') {
       if (typeof stat.id === 'string') candidates.set(stat.id, stat);
+    } else if (stat.type === 'data-channel') {
+      if (typeof stat.bytesSent === 'number') dcBytesSent += stat.bytesSent;
+      if (typeof stat.bytesReceived === 'number') dcBytesReceived += stat.bytesReceived;
+      if (typeof stat.messagesSent === 'number') dcMsgSent += stat.messagesSent;
+      if (typeof stat.messagesReceived === 'number') dcMsgReceived += stat.messagesReceived;
     }
   });
 
@@ -171,33 +207,47 @@ export async function sampleLinkTelemetry(pc: RTCPeerConnection): Promise<LinkTe
 
   if (!activePair) {
     return {
-      route: 'unknown',
-      localCandidateType: null,
-      remoteCandidateType: null,
-      protocol: null,
-      rttMs: null,
-      availableOutgoingBitrate: null,
+      ...emptyTelemetrySnapshot(),
+      dataChannelBytesSent: dcBytesSent,
+      dataChannelBytesReceived: dcBytesReceived,
+      dataChannelMessagesSent: dcMsgSent,
+      dataChannelMessagesReceived: dcMsgReceived,
+      timestamp: now,
     };
   }
 
-  const local = typeof activePair.localCandidateId === 'string' ? candidates.get(activePair.localCandidateId) : undefined;
-  const remote = typeof activePair.remoteCandidateId === 'string' ? candidates.get(activePair.remoteCandidateId) : undefined;
+  const local =
+    typeof activePair.localCandidateId === 'string' ? candidates.get(activePair.localCandidateId) : undefined;
+  const remote =
+    typeof activePair.remoteCandidateId === 'string' ? candidates.get(activePair.remoteCandidateId) : undefined;
 
   const localType = typeof local?.candidateType === 'string' ? local.candidateType : null;
   const remoteType = typeof remote?.candidateType === 'string' ? remote.candidateType : null;
   const protocol = typeof local?.protocol === 'string' ? local.protocol : null;
+  const relayProtocol = typeof local?.relayProtocol === 'string' ? local.relayProtocol : null;
   const rawRtt = typeof activePair.currentRoundTripTime === 'number' ? activePair.currentRoundTripTime : null;
   const rttMs = rawRtt !== null && Number.isFinite(rawRtt) ? Math.round(rawRtt * 1000 * 10) / 10 : null;
   const availableOutgoingBitrate =
     typeof activePair.availableOutgoingBitrate === 'number' ? activePair.availableOutgoingBitrate : null;
+  const bytesSent = typeof activePair.bytesSent === 'number' ? activePair.bytesSent : 0;
+  const bytesReceived = typeof activePair.bytesReceived === 'number' ? activePair.bytesReceived : 0;
 
   return {
-    route: classifyCandidatePair(localType, remoteType, rttMs),
+    route: classifyCandidatePair(localType, remoteType),
     localCandidateType: localType,
     remoteCandidateType: remoteType,
+    candidatePairLabel: formatCandidatePairLabel(localType, remoteType, protocol, relayProtocol),
     protocol,
+    relayProtocol,
     rttMs,
     availableOutgoingBitrate,
+    bytesSent,
+    bytesReceived,
+    dataChannelBytesSent: dcBytesSent,
+    dataChannelBytesReceived: dcBytesReceived,
+    dataChannelMessagesSent: dcMsgSent,
+    dataChannelMessagesReceived: dcMsgReceived,
+    timestamp: now,
   };
 }
 
@@ -207,20 +257,12 @@ export interface IceCascadeCallbacks {
   onRouteChanged?: (snapshot: LinkTelemetrySnapshot) => void;
 }
 
-/**
- * Watches an `RTCPeerConnection` and executes automated self-healing:
- *  1. Initial attempt uses `iceTransportPolicy: 'all'` (Host -> STUN -> TURN).
- *  2. If ICE transitions to `failed` (or stalls in `disconnected`), triggers an
- *     `iceRestart` within 800 ms (roadmap §7).
- *  3. If the restarted session still fails (e.g. strict UDP firewall / Symmetric CGNAT),
- *     escalates to `relay-only` mode over TURN TCP/TLS.
- */
 export class IceCascadeMonitor {
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private disconnectedTimer: ReturnType<typeof setTimeout> | null = null;
   private attempts = 0;
   private disposed = false;
-  private lastRoute: IceRoute = 'unknown';
+  private lastPairLabel = '';
 
   constructor(
     private readonly pc: RTCPeerConnection,
@@ -233,8 +275,8 @@ export class IceCascadeMonitor {
 
   async refreshTelemetry(): Promise<LinkTelemetrySnapshot> {
     const snap = await sampleLinkTelemetry(this.pc);
-    if (snap.route !== this.lastRoute && snap.route !== 'unknown') {
-      this.lastRoute = snap.route;
+    if (snap.candidatePairLabel !== this.lastPairLabel && snap.route !== 'unknown') {
+      this.lastPairLabel = snap.candidatePairLabel;
       this.callbacks.onRouteChanged?.(snap);
     }
     return snap;
@@ -316,7 +358,6 @@ export class IceCascadeMonitor {
 export async function deriveLanSubnetRoomId(): Promise<string> {
   const publicIp = await probeReflexiveAddress(2_400);
   if (!publicIp) return 'lan-local-fallback';
-  // Normalize IPv6 to /64 prefix so dual-stack devices on the same router match; keep full IPv4 NAT address.
   const normalized = publicIp.includes(':')
     ? publicIp.split(':').slice(0, 4).join(':').toLowerCase()
     : publicIp.trim();
@@ -352,7 +393,6 @@ function probeReflexiveAddress(timeoutMs: number): Promise<string | null> {
           if (pc.iceGatheringState === 'complete') done(null);
           return;
         }
-        // SDP candidate format: candidate:foundation comp proto priority ip port typ srflx ...
         const match = cand.match(/\b(?:UDP|udp)\s+\d+\s+([^\s]+)\s+\d+\s+typ\s+srflx\b/);
         if (match?.[1]) done(match[1]);
       });

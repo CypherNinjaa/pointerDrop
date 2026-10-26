@@ -134,7 +134,7 @@ export const Radar: React.FC<RadarProps> = ({
         target: { x: target.x, y: target.y },
         direction: tr.direction,
         channels: tr.activeChannels,
-        degraded: (tr.rttMs ?? 0) > 120,
+        degraded: tr.route === 'relay',
       });
     }
     return out;

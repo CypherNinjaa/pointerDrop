@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --mode web",
+    "dev:https": "vite --mode https",
     "icons": "node scripts/gen-icons.mjs",
     "build": "npm run typecheck && npm run build:web && npm run build:ext",
     "build:web": "vite build --mode web",
@@ -28,6 +29,7 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@types/wicg-file-system-access": "^2023.10.7",
+    "@vitejs/plugin-basic-ssl": "^2.3.0",
     "@vitejs/plugin-react": "^5.2.0",
     "autoprefixer": "^10.6.1",
     "postcss": "^8.5.31",

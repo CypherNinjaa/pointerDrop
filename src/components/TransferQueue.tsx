@@ -125,7 +125,7 @@ export const TransferQueue: React.FC<TransferQueueProps> = ({
                 </span>
               </div>
 
-              {/* Technical Badges: Entropy, Compression, Route */}
+              {/* Technical Badges: Entropy, Compression, Dynamic Chunk/Lanes, Sink, Route, Integrity */}
               <div className="mt-2 flex flex-wrap items-center gap-1.5 font-mono text-[10px] text-ink-tertiary">
                 <span className="rounded border border-white/10 bg-black/35 px-1.5 py-0.5">
                   H={tr.entropy.toFixed(2)} b/B
@@ -133,10 +133,24 @@ export const TransferQueue: React.FC<TransferQueueProps> = ({
                 <span className="rounded border border-white/10 bg-black/35 px-1.5 py-0.5">
                   {tr.compressed
                     ? tr.compressionRatio
-                      ? `LZ4 ${tr.compressionRatio.toFixed(1)}×`
+                      ? `LZ4 ${tr.compressionRatio.toFixed(2)}×`
                       : 'LZ4 Stream'
-                    : 'Zero-Copy Raw'}
+                    : 'Raw Stream'}
                 </span>
+                {(isActive || tr.status === 'completed') && (
+                  <span className="tabular-nums rounded border border-white/10 bg-black/35 px-1.5 py-0.5">
+                    {Math.round(tr.chunkSize / 1024)}K · {tr.activeLanes}L
+                  </span>
+                )}
+                {tr.sink && tr.sink !== 'discard' && (
+                  <span className="rounded border border-white/10 bg-black/35 px-1.5 py-0.5">
+                    {tr.sink === 'opfs-sync'
+                      ? 'OPFS Sync'
+                      : tr.sink === 'opfs-writable'
+                        ? 'OPFS Stream'
+                        : 'Bounded RAM'}
+                  </span>
+                )}
                 {tr.route !== 'unknown' && (
                   <span
                     className={`rounded border px-1.5 py-0.5 ${
@@ -146,8 +160,16 @@ export const TransferQueue: React.FC<TransferQueueProps> = ({
                           ? 'border-cyan-ice/35 text-cyan-ice'
                           : 'border-amber-system/35 text-amber-system'
                     }`}
+                    title={tr.candidatePairLabel}
                   >
-                    typ {tr.route}
+                    {tr.candidatePairLabel && tr.candidatePairLabel !== 'standby'
+                      ? tr.candidatePairLabel
+                      : `typ ${tr.route}`}
+                  </span>
+                )}
+                {tr.status === 'completed' && tr.integrityVerified && (
+                  <span className="rounded border border-lime-signal/40 bg-lime-signal/12 px-1.5 py-0.5 text-lime-signal">
+                    Hash Verified ✓
                   </span>
                 )}
               </div>
