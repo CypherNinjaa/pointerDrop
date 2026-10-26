@@ -1,0 +1,38 @@
+{
+  "name": "airdrop-lan-warp",
+  "private": true,
+  "version": "1.0.0",
+  "description": "AirDrop-LAN-Warp: P2P zero-copy network pointer file-sharing (Web App + Chrome/Edge Side Panel extension)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --mode web",
+    "icons": "node scripts/gen-icons.mjs",
+    "build": "npm run typecheck && npm run build:web && npm run build:ext",
+    "build:web": "vite build --mode web",
+    "build:ext": "vite build --mode extension",
+    "preview": "vite preview --mode web",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@trystero-p2p/mqtt": "^0.26.0",
+    "@trystero-p2p/torrent": "^0.26.0",
+    "framer-motion": "^14.6.0",
+    "lz4-wasm": "^0.9.2",
+    "qrcode": "^1.5.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.3.6",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/wicg-file-system-access": "^2023.10.7",
+    "@vitejs/plugin-react": "^5.2.0",
+    "autoprefixer": "^10.6.1",
+    "postcss": "^8.5.31",
+    "tailwindcss": "^3.4.19",
+    "typescript": "~5.8",
+    "vite": "^7.3.7"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "AirDrop LAN Warp",
+  "short_name": "Warp",
+  "version": "1.0.0",
+  "description": "Zero-copy, high-speed P2P file sharing over local Wi-Fi and WAN",
+  "minimum_chrome_version": "116",
+  "permissions": ["sidePanel", "storage"],
+  "side_panel": {
+    "default_path": "index.html"
+  },
+  "action": {
+    "default_title": "Open AirDrop LAN Warp in Sidebar",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  }
+}
