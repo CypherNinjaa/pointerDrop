@@ -231,6 +231,9 @@ export const Radar: React.FC<RadarProps> = ({
 
   const ringDiameter = Math.max(220, Math.min(bounds.width || 340, bounds.height || 340) * 0.9);
   const totalStagedBytes = stagedFiles.reduce((acc, f) => acc + f.size, 0);
+  const roomPeersCount = activeWarpCode
+    ? peers.filter((p) => p.warpCode === activeWarpCode || p.discoveryVia === 'warp' || p.discoveryVia === 'sonic').length
+    : 0;
 
   return (
     <section
@@ -257,12 +260,16 @@ export const Radar: React.FC<RadarProps> = ({
         <div className="pointer-events-auto inline-flex items-center gap-2 rounded-full border border-white/12 bg-black/45 px-3 py-1 backdrop-blur-md">
           <span
             aria-hidden="true"
-            className={`h-2 w-2 rounded-full ${peers.length > 0 ? 'bg-lime-signal' : 'bg-cyan-warp'}`}
+            className={`h-2 w-2 rounded-full ${peers.length > 0 ? 'bg-lime-signal' : 'bg-cyan-warp animate-pulse'}`}
           />
           <span className="font-medium text-ink-primary" aria-live="polite">
             {peers.length === 0
-              ? 'Scanning local network…'
-              : `${peers.length} ${peers.length === 1 ? 'device' : 'devices'} in range`}
+              ? activeWarpCode
+                ? `Room #${activeWarpCode.slice(0, 3)}-${activeWarpCode.slice(3)} · Waiting for peer…`
+                : 'Scanning local network…'
+              : activeWarpCode && roomPeersCount > 0
+                ? `${peers.length} ${peers.length === 1 ? 'device' : 'devices'} in range · ${roomPeersCount} in Room`
+                : `${peers.length} ${peers.length === 1 ? 'device' : 'devices'} in range`}
           </span>
         </div>
 
@@ -270,9 +277,20 @@ export const Radar: React.FC<RadarProps> = ({
           <button
             type="button"
             onClick={onOpenPairing}
-            className="warp-btn warp-btn-subtle pointer-events-auto inline-flex items-center gap-1.5 rounded-full border border-cyan-ice/35 bg-cyan-warp/15 px-3 py-1 font-mono text-[11px] font-medium text-cyan-ice"
+            className={`warp-btn warp-btn-subtle pointer-events-auto inline-flex items-center gap-1.5 rounded-full border px-3 py-1 font-mono text-[11px] font-medium ${
+              roomPeersCount > 0
+                ? 'border-lime-signal/45 bg-lime-signal/15 text-lime-signal'
+                : 'border-cyan-ice/35 bg-cyan-warp/15 text-cyan-ice'
+            }`}
           >
-            <span>Warp #{activeWarpCode.slice(0, 3)}-{activeWarpCode.slice(3)}</span>
+            <span
+              aria-hidden="true"
+              className={`h-1.5 w-1.5 rounded-full ${roomPeersCount > 0 ? 'bg-lime-signal' : 'bg-cyan-ice'}`}
+            />
+            <span>
+              Warp #{activeWarpCode.slice(0, 3)}-{activeWarpCode.slice(3)}
+              {roomPeersCount > 0 ? ` (${roomPeersCount} joined)` : ''}
+            </span>
           </button>
         ) : (
           subnetRoomId && !compact && (

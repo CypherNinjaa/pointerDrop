@@ -16,7 +16,7 @@
  */
 import { ChannelPool } from '../engine/channelPool';
 import { analyzeBlob } from '../engine/entropy';
-import { decodeFrame } from '../engine/framing';
+import { decodeFrame, encodeFrame, writeFrameHeader } from '../engine/framing';
 import { openDiskSink, purgeInbox, removeInboxFile, streamToHandle, opfsSupported, type DiskSink } from '../engine/opfsDiskStream';
 import {
   DEGRADED_CHANNELS,
@@ -39,6 +39,11 @@ const scope = self as unknown as WorkerScope;
 const post = (message: FromWorker, transfer: Transferable[] = []) => scope.postMessage(message, transfer);
 
 const PROGRESS_INTERVAL_MS = 100;
+/**
+ * Read from OS disk in 8 MB macro-blocks with async read-ahead instead of issuing
+ * 16,384 separate 64 KB Blob IPC round-trips per gigabyte.
+ */
+const DISK_MACRO_BYTES = 8 * 1024 * 1024;
 
 let codec: Lz4Codec | null = null;
 let lz4Error: string | undefined;
@@ -149,51 +154,78 @@ function emitSendProgress(job: SendJob, link: LinkState, force = false): void {
 async function runSend(job: SendJob): Promise<void> {
   const link = getLink(job.linkId);
   const size = job.file.size;
-  const useLz4 = job.compress && codec !== null;
+  let useLz4 = job.compress && codec !== null;
   if (job.compress && !codec) throw new Error('LZ4 codec unavailable in sender worker');
 
   if (link.pool) await waitForOpen(link.pool, job);
 
-  const read = (offset: number, length: number) => job.file.slice(offset, offset + length).arrayBuffer();
+  const readMacro = (offset: number, length: number) => job.file.slice(offset, offset + length).arrayBuffer();
 
-  let offset = 0;
-  let pending: Promise<ArrayBuffer> | null = size > 0 ? read(0, Math.min(effectiveChunk(job, link), size)) : null;
+  let macroOffset = 0;
+  let pendingMacro: Promise<ArrayBuffer> | null =
+    size > 0 ? readMacro(0, Math.min(DISK_MACRO_BYTES, size)) : null;
 
-  while (offset < size && pending) {
+  while (macroOffset < size && pendingMacro) {
     if (job.cancelled) return;
-    const raw = new Uint8Array(await pending);
-    if (raw.byteLength === 0) throw new Error('Source file shrank or became unreadable during transfer');
-    const nextOffset = offset + raw.byteLength;
+    const macroBuf = await pendingMacro;
+    if (macroBuf.byteLength === 0) throw new Error('Source file shrank or became unreadable during transfer');
+    const nextMacroOffset = macroOffset + macroBuf.byteLength;
 
-    // Read-ahead: the next disk slice loads while this one is compressed and dispatched.
-    pending = nextOffset < size ? read(nextOffset, Math.min(effectiveChunk(job, link), size - nextOffset)) : null;
+    // Prefetch the next 8 MB macro-block from OS disk while we stream this 8 MB block.
+    pendingMacro =
+      nextMacroOffset < size
+        ? readMacro(nextMacroOffset, Math.min(DISK_MACRO_BYTES, size - nextMacroOffset))
+        : null;
 
-    let frame: ArrayBuffer;
-    if (useLz4) {
-      frame = codec!.compressFrame(raw, FRAME_HEADER_BYTES);
-    } else {
-      frame = new ArrayBuffer(FRAME_HEADER_BYTES + raw.byteLength);
-      new Uint8Array(frame, FRAME_HEADER_BYTES).set(raw);
+    let innerOffset = 0;
+    while (innerOffset < macroBuf.byteLength) {
+      if (job.cancelled) return;
+
+      await gate(link, job);
+      if (job.cancelled) return;
+
+      const chunkLen = Math.min(effectiveChunk(job, link), macroBuf.byteLength - innerOffset);
+      const raw = new Uint8Array(macroBuf, innerOffset, chunkLen);
+      const fileOffset = macroOffset + innerOffset;
+
+      let frame: ArrayBuffer;
+      if (useLz4) {
+        const compressedFrame = codec!.compressFrame(raw, FRAME_HEADER_BYTES);
+        // Only transmit the LZ4 block if it genuinely shrank the payload by >= 4%.
+        if (compressedFrame.byteLength < FRAME_HEADER_BYTES + raw.byteLength * 0.96) {
+          writeFrameHeader(compressedFrame, fileOffset, true);
+          frame = compressedFrame;
+        } else {
+          frame = encodeFrame(fileOffset, raw, false);
+        }
+      } else {
+        frame = encodeFrame(fileOffset, raw, false);
+      }
+
+      const wireLength = frame.byteLength;
+
+      if (link.pool) {
+        link.pool.setActiveCount(effectiveChannels(link));
+        if (!link.pool.send(frame)) throw new Error('All data channels closed');
+      } else {
+        link.inFlightBytes += wireLength;
+        // Ownership of `frame` moves to the UI thread — no copy is made.
+        post({ type: 'frame-out', linkId: job.linkId, transferId: job.id, data: frame }, [frame]);
+      }
+
+      innerOffset += chunkLen;
+      job.rawBytes = fileOffset + chunkLen;
+      job.wireBytes += wireLength;
+
+      // Auto-bypass LZ4 if after 2 MB the stream proves incompressible (< 1.05x).
+      if (useLz4 && job.rawBytes >= 2 * 1024 * 1024 && job.rawBytes / job.wireBytes < 1.05) {
+        useLz4 = false;
+      }
+
+      emitSendProgress(job, link);
     }
-    new DataView(frame).setFloat64(0, offset, false);
-    const wireLength = frame.byteLength;
 
-    await gate(link, job);
-    if (job.cancelled) return;
-
-    if (link.pool) {
-      link.pool.setActiveCount(effectiveChannels(link));
-      if (!link.pool.send(frame)) throw new Error('All data channels closed');
-    } else {
-      link.inFlightBytes += wireLength;
-      // Ownership of `frame` moves to the UI thread — no copy is made.
-      post({ type: 'frame-out', linkId: job.linkId, transferId: job.id, data: frame }, [frame]);
-    }
-
-    job.rawBytes = nextOffset;
-    job.wireBytes += wireLength;
-    offset = nextOffset;
-    emitSendProgress(job, link);
+    macroOffset = nextMacroOffset;
   }
 
   if (link.pool) await link.pool.flush();
@@ -250,7 +282,7 @@ function handleIncoming(linkId: string, frame: ArrayBuffer): void {
 function ingest(job: RecvJob, frame: ArrayBuffer): void {
   const sink = job.sink!;
   try {
-    const { offset, payload } = decodeFrame(frame);
+    const { offset, compressed, payload } = decodeFrame(frame);
     const write = (bytes: Uint8Array) => {
       if (offset + bytes.byteLength > job.size) throw new RangeError(`Frame at ${offset} overruns file size ${job.size}`);
       const result = sink.write(offset, bytes);
@@ -263,7 +295,7 @@ function ingest(job: RecvJob, frame: ArrayBuffer): void {
       }
     };
     let rawLength: number;
-    if (job.compress) {
+    if (compressed) {
       if (!codec) throw new Error('LZ4 codec unavailable in receiver worker');
       rawLength = codec.decompressInto(payload, write);
     } else {
@@ -338,6 +370,7 @@ async function startRecv(message: Extract<ToWorker, { type: 'recv-start' }>): Pr
     await job.sink.abort();
     return;
   }
+  post({ type: 'recv-ready', transferId: job.id });
   const backlog = job.backlog ?? [];
   job.backlog = null;
   for (const frame of backlog) {

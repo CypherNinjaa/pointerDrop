@@ -15,22 +15,22 @@
 export const CHANNEL_COUNT = 4;
 export const FRAME_HEADER_BYTES = 8;
 
-/** Aggregate SCTP send-buffer level at which disk reads are suspended. */
-export const HIGH_WATERMARK = 4 * 1024 * 1024;
-/** Per-channel `bufferedAmountLowThreshold` / aggregate resume level. */
+/** Aggregate SCTP send-buffer level at which disk reads are suspended (8 MB across 4 channels). */
+export const HIGH_WATERMARK = 8 * 1024 * 1024;
+/** Per-channel `bufferedAmountLowThreshold` (512 KB per channel = 2 MB aggregate resume). */
 export const LOW_WATERMARK = 512 * 1024;
 
 export const ENTROPY_SAMPLE_BYTES = 64 * 1024;
 export const ENTROPY_THRESHOLD = 7.2;
 
 export const MIN_CHUNK = 16 * 1024;
-export const DEGRADED_CHUNK = 32 * 1024;
+export const DEGRADED_CHUNK = 64 * 1024;
 export const DEFAULT_CHUNK = 64 * 1024;
-export const MAX_CHUNK = 256 * 1024;
+export const MAX_CHUNK = 128 * 1024;
 
-/** RTT above which the link is treated as lossy/jittery (roadmap §7). */
-export const DEGRADED_RTT_MS = 120;
-export const DEGRADED_CHANNELS = 2;
+/** RTT above which the link is treated as ultra-high-latency (e.g. satellite / overloaded relay). */
+export const DEGRADED_RTT_MS = 380;
+export const DEGRADED_CHANNELS = 4;
 
 export type IceRoute = 'host' | 'srflx' | 'relay' | 'unknown';
 
@@ -107,6 +107,7 @@ export type FromWorker =
       channels: number;
     }
   | { type: 'send-drained'; transferId: string }
+  | { type: 'recv-ready'; transferId: string }
   | { type: 'recv-progress'; transferId: string; rawBytes: number; wireBytes: number }
   | { type: 'recv-complete'; transferId: string; file: File | null; savedToHandle: boolean }
   | { type: 'transfer-error'; transferId: string; message: string }

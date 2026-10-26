@@ -165,7 +165,7 @@ class MemorySink implements DiskSink {
   }
 }
 
-export async function openDiskSink(transferId: string, displayName: string, size: number, mime = 'application/octet-stream'): Promise<DiskSink> {
+export async function openDiskSink(transferId: string, displayName: string, _size: number, mime = 'application/octet-stream'): Promise<DiskSink> {
   if (opfsSupported()) {
     const name = `${transferId}.part`;
     try {
@@ -173,12 +173,11 @@ export async function openDiskSink(transferId: string, displayName: string, size
       const fileHandle = (await dir.getFileHandle(name, { create: true })) as SyncCapableFileHandle;
       if (typeof fileHandle.createSyncAccessHandle === 'function') {
         const handle = await fileHandle.createSyncAccessHandle();
-        handle.truncate(size); // pre-allocate so random-access writes never extend the file
+        handle.truncate(0); // Reset any stale file immediately without blocking on multi-GB zero-fill.
         return new OpfsSyncSink(fileHandle, handle, name);
       }
       if (typeof fileHandle.createWritable === 'function') {
         const writable = await fileHandle.createWritable({ keepExistingData: false });
-        await writable.truncate(size);
         return new OpfsWritableSink(fileHandle, writable, name);
       }
     } catch (error) {

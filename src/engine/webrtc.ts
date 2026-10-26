@@ -431,7 +431,6 @@ export class WarpWebRTCEngine {
       compress: record.compressed,
       saveHandle: saveChoice.kind === 'handle' ? saveChoice.handle : null,
     });
-    this.sendControl(link, { t: 'accept', id: transferId });
   }
 
   declineOffer(transferId: string): void {
@@ -627,14 +626,67 @@ export class WarpWebRTCEngine {
 
   private wirePeerConnection(link: PeerLink, startNegotiation: boolean): void {
     const { pc } = link;
+    const deferredNonHost: RTCIceCandidateInit[] = [];
+    let deferTimer: ReturnType<typeof setTimeout> | null = null;
+    let sawHostCandidate = false;
+
+    const flushDeferred = () => {
+      if (deferTimer !== null) {
+        clearTimeout(deferTimer);
+        deferTimer = null;
+      }
+      if (link.disposed || deferredNonHost.length === 0) return;
+      // If a direct LAN (`typ host`) link is already connected, don't pollute it with NAT hairpin candidates.
+      if (pc.connectionState === 'connected' && link.telemetry.route === 'host') {
+        deferredNonHost.length = 0;
+        return;
+      }
+      const batch = deferredNonHost.splice(0);
+      for (const candidate of batch) {
+        this.callbacks.sendSignal(link.peerId, {
+          gen: link.gen,
+          stage: link.stage,
+          kind: 'ice',
+          candidate,
+        });
+      }
+    };
 
     pc.addEventListener('icecandidate', (event) => {
-      if (link.disposed || !event.candidate) return;
+      if (link.disposed) return;
+      if (!event.candidate) {
+        flushDeferred();
+        return;
+      }
+      const json = event.candidate.toJSON();
+      const candStr = json.candidate ?? '';
+      const isHost = /\btyp\s+host\b/i.test(candStr);
+      if (isHost) {
+        sawHostCandidate = true;
+        this.callbacks.sendSignal(link.peerId, {
+          gen: link.gen,
+          stage: link.stage,
+          kind: 'ice',
+          candidate: json,
+        });
+        return;
+      }
+
+      // Give `typ host` LAN candidates a 180 ms head-start so same-Wi-Fi devices
+      // never nominate a slower `typ srflx` router-hairpin route first.
+      if (link.stage === 'all' && sawHostCandidate && pc.connectionState !== 'connected') {
+        deferredNonHost.push(json);
+        if (deferTimer === null) {
+          deferTimer = setTimeout(flushDeferred, 180);
+        }
+        return;
+      }
+
       this.callbacks.sendSignal(link.peerId, {
         gen: link.gen,
         stage: link.stage,
         kind: 'ice',
-        candidate: event.candidate.toJSON(),
+        candidate: json,
       });
     });
 
@@ -1055,6 +1107,15 @@ export class WarpWebRTCEngine {
           this.tryFinalizeSend(msg.transferId);
           this.emitTransfers();
         })();
+        break;
+      }
+      case 'recv-ready': {
+        const rec = this.transfers.get(msg.transferId);
+        if (!rec || rec.direction !== 'receive') return;
+        const link = this.links.get(rec.peerId);
+        if (link && link.ctrl.readyState === 'open') {
+          this.sendControl(link, { t: 'accept', id: msg.transferId });
+        }
         break;
       }
       case 'recv-progress': {

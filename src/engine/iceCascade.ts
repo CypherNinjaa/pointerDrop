@@ -77,14 +77,24 @@ export function buildRtcConfig(stage: CascadeStage = 'all', extraTurn: RTCIceSer
     return {
       iceServers: turnPool,
       iceTransportPolicy: 'relay',
-      iceCandidatePoolSize: 4,
+      iceCandidatePoolSize: 2,
       bundlePolicy: 'max-bundle',
     };
   }
+  if (stage === 'restart') {
+    return {
+      iceServers: [...STUN_SERVERS, ...turnPool],
+      iceTransportPolicy: 'all',
+      iceCandidatePoolSize: 2,
+      bundlePolicy: 'max-bundle',
+    };
+  }
+  // Tier 1 + Tier 2 initial handshake: avoid pre-pooling public TURN servers so
+  // direct LAN (`typ host`) and direct STUN (`typ srflx`) always win nomination first.
   return {
-    iceServers: [...STUN_SERVERS, ...turnPool],
+    iceServers: [...STUN_SERVERS, ...custom, ...extraTurn],
     iceTransportPolicy: 'all',
-    iceCandidatePoolSize: 4,
+    iceCandidatePoolSize: 0,
     bundlePolicy: 'max-bundle',
   };
 }
@@ -98,13 +108,26 @@ export interface LinkTelemetrySnapshot {
   availableOutgoingBitrate: number | null;
 }
 
-function classifyCandidatePair(localType: string | null, remoteType: string | null): IceRoute {
+function classifyCandidatePair(
+  localType: string | null,
+  remoteType: string | null,
+  rttMs: number | null,
+): IceRoute {
   if (!localType && !remoteType) return 'unknown';
   if (localType === 'relay' || remoteType === 'relay') return 'relay';
+  if (localType === 'host' && (!remoteType || remoteType === 'host')) return 'host';
+  // On Android <-> Windows over shared Wi-Fi, mDNS (.local) obfuscation often causes
+  // direct LAN packets from a `host` socket to be classified as `prflx` with <12 ms RTT.
+  if (
+    ((localType === 'host' && remoteType === 'prflx') || (localType === 'prflx' && remoteType === 'host')) &&
+    rttMs !== null &&
+    rttMs <= 12
+  ) {
+    return 'host';
+  }
   if (localType === 'srflx' || localType === 'prflx' || remoteType === 'srflx' || remoteType === 'prflx') {
     return 'srflx';
   }
-  if (localType === 'host' && (!remoteType || remoteType === 'host')) return 'host';
   return 'unknown';
 }
 
@@ -169,7 +192,7 @@ export async function sampleLinkTelemetry(pc: RTCPeerConnection): Promise<LinkTe
     typeof activePair.availableOutgoingBitrate === 'number' ? activePair.availableOutgoingBitrate : null;
 
   return {
-    route: classifyCandidatePair(localType, remoteType),
+    route: classifyCandidatePair(localType, remoteType, rttMs),
     localCandidateType: localType,
     remoteCandidateType: remoteType,
     protocol,

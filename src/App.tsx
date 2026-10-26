@@ -79,6 +79,11 @@ export const App: React.FC = () => {
   const [showSettingsDesktop, setShowSettingsDesktop] = useState<boolean>(false);
   const [compactTab, setCompactTab] = useState<CompactSection>('radar');
   const [liveAnnouncement, setLiveAnnouncement] = useState<string>('');
+  const [roomBanner, setRoomBanner] = useState<{
+    peerId: string;
+    peerName: string;
+    warpCode: string;
+  } | null>(null);
   const [micGrantStatus, setMicGrantStatus] = useState<'idle' | 'granted' | 'denied'>('idle');
 
   const nameInputId = useId();
@@ -117,13 +122,19 @@ export const App: React.FC = () => {
       onPeerRemoved: (peerId) => {
         engine?.handlePeerLeft(peerId);
         setSelectedPeerId((prev) => (prev === peerId ? null : prev));
+        setRoomBanner((prev) => (prev?.peerId === peerId ? null : prev));
       },
       onRtcSignal: (peerId, peerName, payload) => {
         void engine?.handleSignal(peerId, peerName, payload);
       },
       onSubnetReady: (roomId) => setSubnetRoomId(roomId),
+      onRoomPeerJoined: (peer, warpCode) => {
+        setLiveAnnouncement(`${peer.name} joined Warp Room ${formatWarpCode(warpCode)}`);
+        setRoomBanner({ peerId: peer.id, peerName: peer.name, warpCode });
+      },
       onWarpRoomState: (code) => {
         setActiveWarpCode(code);
+        if (!code) setRoomBanner(null);
         if ( typeof window !== 'undefined') {
           if (code) {
             const formatted = formatWarpCode(code);
@@ -156,6 +167,7 @@ export const App: React.FC = () => {
       },
       onRemoteHello: (peerId, name, kind) => {
         signaling.updatePeerIdentity(peerId, name, kind);
+        setRoomBanner((prev) => (prev && prev.peerId === peerId ? { ...prev, peerName: name } : prev));
       },
     });
 
@@ -437,6 +449,94 @@ export const App: React.FC = () => {
         </nav>
       )}
 
+      {/* Live Room Join Notification Banner */}
+      {activeWarpCode && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="z-20 mx-auto mt-2.5 flex w-full max-w-[1360px] px-4 sm:px-6"
+        >
+          {(() => {
+            const joinedPeers = peers.filter(
+              (p) => p.warpCode === activeWarpCode || p.discoveryVia === 'warp' || p.discoveryVia === 'sonic',
+            );
+            const primaryJoined =
+              (roomBanner ? joinedPeers.find((p) => p.id === roomBanner.peerId) : null) ?? joinedPeers[0] ?? null;
+
+            if (primaryJoined) {
+              return (
+                <div className="flex w-full flex-wrap items-center justify-between gap-2 rounded-2xl border border-lime-signal/40 bg-lime-signal/[0.11] px-3.5 py-2 text-xs backdrop-blur-md">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-lime-signal" aria-hidden="true" />
+                    <span className="truncate font-semibold text-white">
+                      {joinedPeers.length === 1
+                        ? `${primaryJoined.name} joined Room #${formatWarpCode(activeWarpCode)}`
+                        : `${joinedPeers.map((p) => p.name).join(', ')} joined Room #${formatWarpCode(activeWarpCode)}`}
+                    </span>
+                    <span className="hidden font-mono text-[11px] text-lime-signal sm:inline">
+                      · Ready to share
+                    </span>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (stagedFiles.length > 0) {
+                          handleSendFilesToPeer(primaryJoined, stagedFiles);
+                          return;
+                        }
+                        const picked = await pickFiles();
+                        if (picked.length > 0) handleSendFilesToPeer(primaryJoined, picked);
+                      }}
+                      className="warp-btn warp-btn-primary rounded-full bg-cyan-warp px-3 py-1 text-[11px] font-semibold text-white"
+                    >
+                      Send File to {primaryJoined.name}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleLeaveWarpCode()}
+                      className="warp-btn rounded-full border border-white/15 bg-white/[0.06] px-2.5 py-1 text-[11px] text-ink-secondary hover:text-white"
+                    >
+                      Leave
+                    </button>
+                  </div>
+                </div>
+              );
+            }
+
+            return (
+              <div className="flex w-full flex-wrap items-center justify-between gap-2 rounded-2xl border border-cyan-ice/30 bg-cyan-warp/[0.1] px-3.5 py-2 text-xs backdrop-blur-md">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="h-2 w-2 shrink-0 rounded-full bg-cyan-ice animate-pulse" aria-hidden="true" />
+                  <span className="truncate font-medium text-ink-primary">
+                    Room <span className="font-mono font-semibold text-white">#{formatWarpCode(activeWarpCode)}</span> active · Waiting for peer to join…
+                  </span>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (compact) setCompactTab('pair');
+                      else setShowPairingDesktop(true);
+                    }}
+                    className="warp-btn rounded-full border border-cyan-ice/40 bg-cyan-warp/20 px-2.5 py-1 text-[11px] font-medium text-cyan-ice"
+                  >
+                    Room Code & QR
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleLeaveWarpCode()}
+                    className="warp-btn rounded-full border border-white/15 bg-white/[0.06] px-2.5 py-1 text-[11px] text-ink-secondary hover:text-white"
+                  >
+                    Leave
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+        </div>
+      )}
+
       {/* Main Content Stage */}
       <main className="mx-auto flex w-full max-w-[1360px] flex-1 flex-col gap-4 px-4 py-3.5 sm:px-6 lg:flex-row">
         {/* Primary Spatial Radar Column */}
@@ -474,10 +574,19 @@ export const App: React.FC = () => {
             {((!compact && showPairingDesktop) || (compact && compactTab === 'pair')) && (
               <PairingSheet
                 activeWarpCode={activeWarpCode}
+                peers={peers}
                 isExtensionSidePanel={isExtensionSidePanel}
                 compact={compact}
                 onJoinWarpCode={handleJoinWarpCode}
                 onLeaveWarpCode={handleLeaveWarpCode}
+                onSendToPeer={async (peer) => {
+                  if (stagedFiles.length > 0) {
+                    handleSendFilesToPeer(peer, stagedFiles);
+                    return;
+                  }
+                  const picked = await pickFiles();
+                  if (picked.length > 0) handleSendFilesToPeer(peer, picked);
+                }}
                 onClose={!compact ? () => setShowPairingDesktop(false) : undefined}
               />
             )}

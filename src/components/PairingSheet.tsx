@@ -5,6 +5,7 @@ import {
   formatWarpCode,
   generateWarpCode,
   normalizeWarpCode,
+  type PeerPresence,
 } from '../engine/signaling';
 import {
   emitSonicChirp,
@@ -16,19 +17,23 @@ import { GlassCard } from './GlassCard';
 
 export interface PairingSheetProps {
   activeWarpCode: string | null;
+  peers: PeerPresence[];
   isExtensionSidePanel: boolean;
   compact: boolean;
   onJoinWarpCode: (code: string, via: 'warp' | 'sonic') => Promise<string>;
   onLeaveWarpCode: () => Promise<void>;
+  onSendToPeer?: (peer: PeerPresence) => void;
   onClose?: () => void;
 }
 
 export const PairingSheet: React.FC<PairingSheetProps> = ({
   activeWarpCode,
+  peers,
   isExtensionSidePanel,
   compact,
   onJoinWarpCode,
   onLeaveWarpCode,
+  onSendToPeer,
   onClose,
 }) => {
   const inputId = useId();
@@ -58,8 +63,18 @@ export const PairingSheet: React.FC<PairingSheetProps> = ({
     if (activeWarpCode) setHostCode(activeWarpCode);
   }, [activeWarpCode]);
 
+  // Automatically open/host the displayed Warp Room when the pairing panel is opened
+  // so a peer scanning the QR code or typing the displayed token connects immediately.
+  useEffect(() => {
+    if (!activeWarpCode && hostCode) {
+      void onJoinWarpCode(hostCode, 'warp').catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const effectiveCode = activeWarpCode ?? hostCode;
   const deepLink = buildWarpDeepLink(effectiveCode);
+  const roomPeers = peers.filter((p) => !activeWarpCode || p.warpCode === activeWarpCode || p.discoveryVia === 'warp' || p.discoveryVia === 'sonic');
 
   useEffect(() => {
     let cancelled = false;
@@ -259,17 +274,34 @@ export const PairingSheet: React.FC<PairingSheetProps> = ({
                 {activeWarpCode ? 'Active Session Token' : 'Your Ephemeral Warp Code'}
               </span>
               {activeWarpCode ? (
-                <button
-                  type="button"
-                  onClick={() => void onLeaveWarpCode()}
-                  className="warp-btn text-[11px] font-medium text-amber-system hover:underline"
-                >
-                  Leave Room
-                </button>
+                <div className="flex items-center gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = generateWarpCode();
+                      setHostCode(next);
+                      void onJoinWarpCode(next, 'warp').catch(() => {});
+                    }}
+                    className="warp-btn text-[11px] font-medium text-cyan-ice hover:underline"
+                  >
+                    New Code
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void onLeaveWarpCode()}
+                    className="warp-btn text-[11px] font-medium text-amber-system hover:underline"
+                  >
+                    Leave Room
+                  </button>
+                </div>
               ) : (
                 <button
                   type="button"
-                  onClick={() => setHostCode(generateWarpCode())}
+                  onClick={() => {
+                    const next = generateWarpCode();
+                    setHostCode(next);
+                    void onJoinWarpCode(next, 'warp').catch(() => {});
+                  }}
                   className="warp-btn text-[11px] font-medium text-cyan-ice hover:underline"
                 >
                   Regenerate
@@ -414,6 +446,72 @@ export const PairingSheet: React.FC<PairingSheetProps> = ({
           </div>
         </div>
       )}
+      {/* Live Room Roster — Displays Joined Peers Immediately */}
+      <div className="mt-3 calm-row rounded-2xl p-3" role="region" aria-label="Room members">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span
+              aria-hidden="true"
+              className={`h-2 w-2 rounded-full ${
+                roomPeers.length > 0 ? 'bg-lime-signal' : 'bg-cyan-warp animate-pulse'
+              }`}
+            />
+            <span className="text-xs font-semibold text-ink-primary">
+              Room #{formatWarpCode(effectiveCode)} ({roomPeers.length} {roomPeers.length === 1 ? 'peer' : 'peers'} joined)
+            </span>
+          </div>
+          <span className="font-mono text-[10px] text-ink-tertiary">
+            {roomPeers.length > 0 ? 'Ready to transfer' : 'Listening…'}
+          </span>
+        </div>
+
+        {roomPeers.length === 0 ? (
+          <p className="mt-1.5 text-[11px] text-ink-secondary">
+            Waiting for another device to join <span className="font-mono text-white">{formatWarpCode(effectiveCode)}</span> via code, link, QR, or Sonic Drop…
+          </p>
+        ) : (
+          <ul className="mt-2 space-y-1.5">
+            {roomPeers.map((peer) => (
+              <li
+                key={peer.id}
+                className="flex items-center justify-between gap-2 rounded-xl border border-lime-signal/30 bg-lime-signal/[0.08] px-2.5 py-2"
+              >
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    <span className="h-2 w-2 shrink-0 rounded-full bg-lime-signal" aria-hidden="true" />
+                    <span className="truncate text-xs font-semibold text-white">{peer.name}</span>
+                  </div>
+                  <div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] text-ink-secondary">
+                    <span>{peer.platform}</span>
+                    <span>·</span>
+                    <span className="text-lime-signal">
+                      {peer.connectionState === 'connected'
+                        ? peer.route === 'host'
+                          ? 'LAN Direct'
+                          : peer.route === 'srflx'
+                            ? 'WAN P2P'
+                            : peer.route === 'relay'
+                              ? 'TURN Relay'
+                              : 'Connected'
+                        : 'Joined Room'}
+                    </span>
+                    {peer.rttMs !== null && <span>({Math.round(peer.rttMs)} ms)</span>}
+                  </div>
+                </div>
+                {onSendToPeer && (
+                  <button
+                    type="button"
+                    onClick={() => onSendToPeer(peer)}
+                    className="warp-btn warp-btn-primary shrink-0 rounded-lg bg-cyan-warp px-2.5 py-1.5 text-[11px] font-semibold text-white"
+                  >
+                    Send File
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </GlassCard>
   );
 };

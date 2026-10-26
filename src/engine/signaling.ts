@@ -1,3 +1,4 @@
+import mqtt, { type MqttClient } from 'mqtt';
 import { joinRoom as joinMqttRoom, selfId, type JsonValue, type Room } from '@trystero-p2p/mqtt';
 import { joinRoom as joinTorrentRoom } from '@trystero-p2p/torrent';
 import { deriveLanSubnetRoomId } from './iceCascade';
@@ -182,6 +183,7 @@ export interface SignalingCallbacks {
   onRtcSignal: (peerId: string, peerName: string, payload: SignalWirePayload) => void;
   onSubnetReady?: (subnetRoomId: string) => void;
   onWarpRoomState?: (code: string | null, status: 'idle' | 'joining' | 'active') => void;
+  onRoomPeerJoined?: (peer: PeerPresence, warpCode: string) => void;
 }
 
 /**
@@ -199,11 +201,15 @@ export class SignalingCoordinator {
 
   private localBus: BroadcastChannel | null = null;
   private readonly localPeerIds = new Set<string>();
+  private readonly mqttClients: MqttClient[] = [];
+  private readonly mqttPeerIds = new Set<string>();
   private lanRoom: ManagedRoom | null = null;
   private warpRoom: ManagedRoom | null = null;
   private activeWarpCode: string | null = null;
+  private subnetRoomKey: string | null = null;
 
   private readonly peers = new Map<string, PeerPresence>();
+  private readonly notifiedWarpJoins = new Set<string>();
   private readonly seenSignalIds = new Set<string>();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
@@ -219,11 +225,12 @@ export class SignalingCoordinator {
 
   async start(): Promise<void> {
     this.setupLocalBus();
+    this.setupDirectMqttBus();
     this.announceLocal('lan-local', 'local', null);
 
     this.heartbeatTimer = setInterval(() => {
       this.broadcastPresenceRefresh();
-    }, 8_000);
+    }, 6_000);
 
     if (typeof window !== 'undefined') {
       window.addEventListener('beforeunload', this.handleBeforeUnload);
@@ -231,7 +238,10 @@ export class SignalingCoordinator {
 
     const subnetRoomId = await deriveLanSubnetRoomId();
     if (this.disposed) return;
+    this.subnetRoomKey = subnetRoomId;
     this.callbacks.onSubnetReady?.(subnetRoomId);
+    this.subscribeMqttRoom(subnetRoomId);
+    this.announceMqtt(subnetRoomId, 'lan', null);
     this.lanRoom = this.openTrackerRoom(subnetRoomId, 'lan', null);
   }
 
@@ -262,9 +272,17 @@ export class SignalingCoordinator {
 
     await this.leaveWarpCode();
     this.activeWarpCode = code;
+    this.notifiedWarpJoins.clear();
     this.callbacks.onWarpRoomState?.(code, 'joining');
 
     const roomKey = `warp-${code}`;
+    this.subscribeMqttRoom(roomKey);
+    this.announceMqtt(roomKey, via, code);
+    setTimeout(() => {
+      if (!this.disposed && this.activeWarpCode === code) {
+        this.announceMqtt(roomKey, via, code);
+      }
+    }, 450);
     this.warpRoom = this.openTrackerRoom(roomKey, via, code);
     this.announceLocal(roomKey, via, code);
     this.callbacks.onWarpRoomState?.(code, 'active');
@@ -273,8 +291,13 @@ export class SignalingCoordinator {
 
   async leaveWarpCode(): Promise<void> {
     const prev = this.warpRoom;
+    const prevCode = this.activeWarpCode;
     this.warpRoom = null;
     this.activeWarpCode = null;
+    this.notifiedWarpJoins.clear();
+    if (prevCode) {
+      this.unsubscribeMqttRoom(`warp-${prevCode}`);
+    }
     if (prev) {
       await Promise.allSettled(prev.rooms.map((r) => r.leave()));
       // Prune peers only reachable through that warp room.
@@ -284,6 +307,16 @@ export class SignalingCoordinator {
         }
       }
     }
+    for (const [peerId, peer] of this.peers) {
+      if (peer.warpCode && prevCode && peer.warpCode === prevCode) {
+        if (!this.localPeerIds.has(peerId) && !this.lanRoom?.peerSet.has(peerId)) {
+          this.removePeer(peerId);
+        } else {
+          peer.warpCode = null;
+        }
+      }
+    }
+    this.callbacks.onPeersChange(this.getPeers());
     this.callbacks.onWarpRoomState?.(null, 'idle');
   }
 
@@ -314,18 +347,23 @@ export class SignalingCoordinator {
   /** Routes an SDP or ICE signal over the fastest active bus for `peerId`. */
   sendRtcSignal(peerId: string, payload: SignalWirePayload): void {
     const msgId = randomId(6);
+    const wireMsg: LocalBusMessage = {
+      kind: 'rtc',
+      msgId,
+      from: this.selfPeerId,
+      fromName: this.selfName,
+      to: peerId,
+      payload,
+    };
+
     if (this.localBus && this.localPeerIds.has(peerId)) {
-      const msg: LocalBusMessage = {
-        kind: 'rtc',
-        msgId,
-        from: this.selfPeerId,
-        fromName: this.selfName,
-        to: peerId,
-        payload,
-      };
-      this.localBus.postMessage(msg);
+      this.localBus.postMessage(wireMsg);
       return;
     }
+
+    // Always publish over the direct MQTT WebSocket unicast topic (~35 ms cross-network,
+    // works even when both peers are behind Symmetric CGNAT where Trystero's internal STUN fails).
+    this.publishMqttPeer(peerId, wireMsg);
 
     const envelope = { msgId, fromName: this.selfName, signal: payload };
     if (this.warpRoom?.peerSet.has(peerId)) {
@@ -360,6 +398,20 @@ export class SignalingCoordinator {
       }
       this.localBus = null;
     }
+    for (const client of this.mqttClients) {
+      try {
+        if (this.activeWarpCode) {
+          client.publish(
+            this.roomTopic(`warp-${this.activeWarpCode}`),
+            JSON.stringify({ kind: 'bye', from: this.selfPeerId } satisfies LocalBusMessage),
+          );
+        }
+        client.end(true);
+      } catch {
+        // Ignore.
+      }
+    }
+    this.mqttClients.length = 0;
     const rooms = [...(this.lanRoom?.rooms ?? []), ...(this.warpRoom?.rooms ?? [])];
     this.lanRoom = null;
     this.warpRoom = null;
@@ -416,6 +468,132 @@ export class SignalingCoordinator {
       });
     } catch {
       this.localBus = null;
+    }
+  }
+
+  private roomTopic(roomKey: string): string {
+    return `${APP_ID}/room/${roomKey}`;
+  }
+
+  private peerTopic(peerId: string): string {
+    return `${APP_ID}/peer/${peerId}`;
+  }
+
+  private setupDirectMqttBus(): void {
+    const selfTopic = this.peerTopic(this.selfPeerId);
+    for (const url of MQTT_RELAY_URLS) {
+      try {
+        const client = mqtt.connect(url, {
+          queueQoSZero: false,
+          resubscribe: true,
+          connectTimeout: 8_000,
+        });
+        this.mqttClients.push(client);
+
+        client.on('connect', () => {
+          if (this.disposed) return;
+          client.subscribe(selfTopic);
+          if (this.subnetRoomKey) {
+            client.subscribe(this.roomTopic(this.subnetRoomKey));
+            this.announceMqtt(this.subnetRoomKey, 'lan', null);
+          }
+          if (this.activeWarpCode) {
+            const warpKey = `warp-${this.activeWarpCode}`;
+            client.subscribe(this.roomTopic(warpKey));
+            this.announceMqtt(warpKey, this.warpRoom?.via ?? 'warp', this.activeWarpCode);
+          }
+        });
+
+        client.on('message', (_topic, payloadBuf) => {
+          if (this.disposed) return;
+          try {
+            const msg = JSON.parse(payloadBuf.toString()) as LocalBusMessage;
+            if (!msg || msg.from === this.selfPeerId) return;
+
+            if (msg.kind === 'hello') {
+              const matchesLan = this.subnetRoomKey !== null && msg.room === this.subnetRoomKey;
+              const matchesWarp = this.activeWarpCode !== null && msg.room === `warp-${this.activeWarpCode}`;
+              if (!matchesLan && !matchesWarp) return;
+              this.mqttPeerIds.add(msg.from);
+              if (matchesWarp && this.warpRoom) this.warpRoom.peerSet.add(msg.from);
+              if (matchesLan && this.lanRoom) this.lanRoom.peerSet.add(msg.from);
+              this.upsertPeer(msg.from, msg.announce);
+
+              const reply: LocalBusMessage = {
+                kind: 'welcome',
+                from: this.selfPeerId,
+                to: msg.from,
+                room: msg.room,
+                announce: this.buildAnnounce(
+                  matchesWarp ? (this.warpRoom?.via ?? 'warp') : 'lan',
+                  matchesWarp ? this.activeWarpCode : null,
+                ),
+              };
+              this.publishMqttPeer(msg.from, reply);
+            } else if (msg.kind === 'welcome' && msg.to === this.selfPeerId) {
+              this.mqttPeerIds.add(msg.from);
+              if (msg.announce.warpCode && this.warpRoom && msg.announce.warpCode === this.activeWarpCode) {
+                this.warpRoom.peerSet.add(msg.from);
+              }
+              this.upsertPeer(msg.from, msg.announce);
+            } else if (msg.kind === 'bye') {
+              this.mqttPeerIds.delete(msg.from);
+              this.warpRoom?.peerSet.delete(msg.from);
+              this.lanRoom?.peerSet.delete(msg.from);
+              if (!this.localPeerIds.has(msg.from)) {
+                this.removePeer(msg.from);
+              }
+            } else if (msg.kind === 'rtc' && msg.to === this.selfPeerId) {
+              if (!this.acceptUniqueSignal(msg.msgId)) return;
+              this.mqttPeerIds.add(msg.from);
+              this.callbacks.onRtcSignal(msg.from, msg.fromName, msg.payload);
+            }
+          } catch {
+            // Ignore malformed payload.
+          }
+        });
+
+        client.on('error', () => {
+          // Handled silently by automatic reconnection + redundant broker.
+        });
+      } catch {
+        // Ignore broker init failure.
+      }
+    }
+  }
+
+  private subscribeMqttRoom(roomKey: string): void {
+    const topic = this.roomTopic(roomKey);
+    for (const client of this.mqttClients) {
+      if (client.connected) client.subscribe(topic);
+    }
+  }
+
+  private unsubscribeMqttRoom(roomKey: string): void {
+    const topic = this.roomTopic(roomKey);
+    for (const client of this.mqttClients) {
+      if (client.connected) client.unsubscribe(topic);
+    }
+  }
+
+  private announceMqtt(roomKey: string, via: DiscoveryChannel, warpCode: string | null): void {
+    const topic = this.roomTopic(roomKey);
+    const data = JSON.stringify({
+      kind: 'hello',
+      from: this.selfPeerId,
+      room: roomKey,
+      announce: this.buildAnnounce(via, warpCode),
+    } satisfies LocalBusMessage);
+    for (const client of this.mqttClients) {
+      if (client.connected) client.publish(topic, data);
+    }
+  }
+
+  private publishMqttPeer(peerId: string, msg: LocalBusMessage): void {
+    const topic = this.peerTopic(peerId);
+    const data = JSON.stringify(msg);
+    for (const client of this.mqttClients) {
+      if (client.connected) client.publish(topic, data);
     }
   }
 
@@ -525,7 +703,21 @@ export class SignalingCoordinator {
       room.onPeerJoin = (peerId) => {
         if (peerId === this.selfPeerId) return;
         managed.peerSet.add(peerId);
-        sendHello(this.buildAnnounce(managed.via, managed.warpCode), peerId);
+        // Surface peer in UI immediately on room join while full name handshake completes.
+        if (!this.peers.has(peerId)) {
+          this.upsertPeer(peerId, {
+            name: `Peer · ${peerId.slice(0, 3).toUpperCase()}`,
+            deviceKind: 'desktop',
+            platform: 'Web',
+            via: managed.via,
+            warpCode: managed.warpCode,
+          });
+        }
+        const announce = this.buildAnnounce(managed.via, managed.warpCode);
+        sendHello(announce, peerId);
+        setTimeout(() => {
+          if (!this.disposed) sendHello(this.buildAnnounce(managed.via, managed.warpCode), peerId);
+        }, 300);
       };
 
       room.onPeerLeave = (peerId) => {
@@ -549,8 +741,13 @@ export class SignalingCoordinator {
 
   private broadcastPresenceRefresh(): void {
     this.announceLocal('lan-local', 'local', null);
+    if (this.subnetRoomKey) {
+      this.announceMqtt(this.subnetRoomKey, 'lan', null);
+    }
     if (this.activeWarpCode) {
-      this.announceLocal(`warp-${this.activeWarpCode}`, this.warpRoom?.via ?? 'warp', this.activeWarpCode);
+      const warpKey = `warp-${this.activeWarpCode}`;
+      this.announceLocal(warpKey, this.warpRoom?.via ?? 'warp', this.activeWarpCode);
+      this.announceMqtt(warpKey, this.warpRoom?.via ?? 'warp', this.activeWarpCode);
     }
     if (this.lanRoom) {
       const payload = this.buildAnnounce('lan', null);
@@ -566,7 +763,11 @@ export class SignalingCoordinator {
     const now = Date.now();
     const existing = this.peers.get(peerId);
     if (existing) {
-      existing.name = announce.name || existing.name;
+      const prevWarp = existing.warpCode;
+      const hadGenericName = existing.name.startsWith('Peer · ');
+      if (announce.name && (!announce.name.startsWith('Peer · ') || hadGenericName)) {
+        existing.name = announce.name;
+      }
       existing.deviceKind = announce.deviceKind;
       existing.platform = announce.platform || existing.platform;
       if (announce.via === 'sonic') existing.discoveryVia = 'sonic';
@@ -574,12 +775,23 @@ export class SignalingCoordinator {
       if (announce.warpCode) existing.warpCode = announce.warpCode;
       existing.lastSeen = now;
       this.callbacks.onPeersChange(this.getPeers());
+      if (
+        existing.warpCode &&
+        existing.warpCode === this.activeWarpCode &&
+        (!prevWarp || (hadGenericName && !existing.name.startsWith('Peer · ')))
+      ) {
+        const key = `${peerId}:${existing.warpCode}:${existing.name}`;
+        if (!this.notifiedWarpJoins.has(key)) {
+          this.notifiedWarpJoins.add(key);
+          this.callbacks.onRoomPeerJoined?.(existing, existing.warpCode);
+        }
+      }
       return;
     }
 
     const created: PeerPresence = {
       id: peerId,
-      name: announce.name,
+      name: announce.name || `Peer · ${peerId.slice(0, 3).toUpperCase()}`,
       deviceKind: announce.deviceKind,
       platform: announce.platform,
       discoveryVia: announce.via,
@@ -593,6 +805,11 @@ export class SignalingCoordinator {
     this.peers.set(peerId, created);
     this.callbacks.onPeerDiscovered(created);
     this.callbacks.onPeersChange(this.getPeers());
+    if (created.warpCode && created.warpCode === this.activeWarpCode) {
+      const key = `${peerId}:${created.warpCode}:${created.name}`;
+      this.notifiedWarpJoins.add(key);
+      this.callbacks.onRoomPeerJoined?.(created, created.warpCode);
+    }
   }
 
   private removePeer(peerId: string): void {
