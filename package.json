@@ -8,6 +8,7 @@
     "dev": "vite --mode web",
     "dev:https": "vite --mode https",
     "turbo": "node scripts/warp-turbo.mjs",
+    "build:turbo-exe": "node scripts/build-sea-exe.mjs",
     "icons": "node scripts/gen-icons.mjs",
     "build": "npm run typecheck && npm run build:web && npm run build:ext",
     "build:web": "vite build --mode web",

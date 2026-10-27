@@ -1,0 +1,4 @@
+{
+  "main": "dist-sea/turbo.cjs",
+  "output": "dist-sea/sea-prep.blob"
+}

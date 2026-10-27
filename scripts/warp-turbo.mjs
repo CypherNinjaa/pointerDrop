@@ -20,8 +20,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT_DIR = path.resolve(__dirname, '..');
+const SCRIPT_DIR = typeof __dirname !== 'undefined' ? __dirname : path.dirname(fileURLToPath(import.meta.url));
+const ROOT_DIR = path.resolve(SCRIPT_DIR, '..');
 const DIST_DIR = path.join(ROOT_DIR, 'dist');
 const PORT = Number(process.env.WARP_TURBO_PORT || process.env.PORT || 8787);
 const INSTANCE_ID = crypto.randomBytes(8).toString('hex');
