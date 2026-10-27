@@ -327,7 +327,7 @@ function syncTuneToPoolOrBridge(
       p.setHighWatermark(effectiveWatermark);
     }
   }
-  const activeChannelTotal = channels + Math.max(0, cfg.lanes - 1) * 2;
+  const activeChannelTotal = channels + Math.max(0, cfg.lanes - 1) * 4;
   post({
     type: 'tune',
     linkId: link.id,

@@ -16,16 +16,16 @@
  */
 
 export const CHANNEL_COUNT = 4;
-export const LANE_CHANNELS = 2;
+export const LANE_CHANNELS = 4;
 export const FRAME_HEADER_BYTES = 8;
 
 /** Absolute bounds for the adaptive aggregate send-queue high watermark. */
-export const MIN_HIGH_WATERMARK = 1024 * 1024;
-export const MAX_HIGH_WATERMARK = 32 * 1024 * 1024;
-/** Initial watermark (4 MiB) keeps multi-channel pipes full before BDP settles. */
-export const INITIAL_HIGH_WATERMARK = 4 * 1024 * 1024;
+export const MIN_HIGH_WATERMARK = 2 * 1024 * 1024;
+export const MAX_HIGH_WATERMARK = 64 * 1024 * 1024;
+/** Initial watermark (16 MiB) keeps multi-channel multi-lane pipes saturated before BDP settles. */
+export const INITIAL_HIGH_WATERMARK = 16 * 1024 * 1024;
 export const HIGH_WATERMARK = INITIAL_HIGH_WATERMARK;
-export const LOW_WATERMARK = 512 * 1024;
+export const LOW_WATERMARK = 1024 * 1024;
 
 export const ENTROPY_SAMPLE_BYTES = 64 * 1024;
 export const ENTROPY_THRESHOLD = 7.2;

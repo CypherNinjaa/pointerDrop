@@ -278,37 +278,36 @@ export function negotiateJointTransferPlan(
 
   const bothWiredOrUltraLowRtt =
     (sMed === 'ethernet' && rMed === 'ethernet') || (route === 'host' && rttMs !== null && rttMs <= 2.5);
+  const isDirectLan = route === 'host';
   const wifiDoubleHop = sMed === 'wifi' && rMed === 'wifi';
   const minCores = Math.min(sender.cores, receiverHw?.cores ?? 4);
 
   const initialChunk =
     transport === 'local-bus' || transport === 'lan-turbo'
       ? 256 * 1024
-      : transport === 'blast-nack'
-        ? bothWiredOrUltraLowRtt
-          ? 64 * 1024
-          : 32 * 1024
-        : bothWiredOrUltraLowRtt
-          ? 128 * 1024
-          : 64 * 1024;
+      : isDirectLan || bothWiredOrUltraLowRtt
+        ? 128 * 1024
+        : 64 * 1024;
 
   const initialLanes =
     transport === 'local-bus' || transport === 'lan-turbo'
       ? 1
-      : route === 'relay' || wifiDoubleHop || minCores <= 4
+      : route === 'relay' || wifiDoubleHop || minCores <= 2
         ? 1
-        : bothWiredOrUltraLowRtt
-          ? 2
-          : 1;
+        : isDirectLan
+          ? Math.min(sender.maxExtraLanes + 1, receiverHw ? 4 : 3)
+          : bothWiredOrUltraLowRtt
+            ? 3
+            : 2;
 
   const initialWatermark =
     transport === 'local-bus' || transport === 'lan-turbo'
-      ? 16 * MB
-      : bothWiredOrUltraLowRtt
-        ? 8 * MB
-        : wifiDoubleHop
-          ? 4 * MB
-          : 4 * MB;
+      ? 32 * MB
+      : isDirectLan
+        ? 16 * MB
+        : bothWiredOrUltraLowRtt
+          ? 16 * MB
+          : 8 * MB;
   const useSenderRamPreload = fileSize > 0 && fileSize <= sender.senderRamPreloadBudget;
 
   return {
@@ -363,7 +362,7 @@ export interface EpochSample {
 type Move = 'chunk+' | 'lanes+' | 'chunk-' | 'lanes-';
 const MOVE_ORDER: Move[] = ['chunk+', 'lanes+', 'chunk-', 'lanes-'];
 const CPU_MOVE_ORDER: Move[] = ['chunk+', 'chunk-'];
-const ACCEPT_GAIN = 1.05;
+const ACCEPT_GAIN = 1.01;
 const MEASURE_EPOCHS = 2;
 const REPROBE_MS = 12_000;
 
@@ -379,8 +378,8 @@ export function classifyBottleneck(
   if (dw >= 0.28) return 'disk';
   const baseRtt = minRttMs > 0 ? minRttMs : s.rttMs;
   // Normal 802.11ac/ax A-MPDU aggregation produces 35–80 ms active RTT; only trigger
-  // bufferbloat mitigation on severe standing router queue inflation (> 125 ms and > 8x base + 85 ms).
-  if (qw >= 0.32 && s.rttMs > Math.max(125, baseRtt * 8 + 85)) return 'bufferbloat';
+  // bufferbloat mitigation on severe standing router queue inflation (> 150 ms and > 8x base + 100 ms).
+  if (qw >= 0.40 && s.rttMs > Math.max(150, baseRtt * 8 + 100)) return 'bufferbloat';
   if (qw >= 0.22) return 'network';
   if (s.drainedBytes <= 0) return 'idle';
   return 'cpu';
@@ -421,23 +420,19 @@ export class AdaptiveTuner {
     this.transport = transport;
     // Only inherit seeded chunk/lane values when they come from the same transport family.
     const compatibleSeed = seed && (!seed.transport || seed.transport === transport) ? seed : null;
-    // In Blast-NACK mode, cap chunk size at 64 KiB so each datagram burst is ≤ 55 MTU fragments.
-    const effectiveMaxChunk = this.transport === 'blast-nack' ? Math.min(maxChunk, 64 * 1024) : maxChunk;
-    this.maxChunkIdx = Math.max(0, ladderIndexAtMost(effectiveMaxChunk));
+    this.maxChunkIdx = Math.max(0, ladderIndexAtMost(maxChunk));
     const defaultInitChunk =
       this.transport === 'local-bus' || this.transport === 'lan-turbo'
         ? 256 * 1024
-        : this.transport === 'blast-nack'
-          ? 32 * 1024
-          : profile.initialChunk;
+        : profile.initialChunk;
     this.chunkIdx = Math.min(this.maxChunkIdx, ladderIndexAtMost(compatibleSeed?.chunk ?? defaultInitChunk));
     this.availableLanes = Math.max(1, availableLanes);
-    const initialLanes = compatibleSeed?.lanes ?? 1;
+    const initialLanes = compatibleSeed?.lanes ?? (this.availableLanes >= 3 ? Math.min(this.availableLanes, 4) : 1);
     this.config = {
       chunk: CHUNK_LADDER[this.chunkIdx],
       lanes: clamp(initialLanes, 1, this.availableLanes),
       highWatermark: clamp(
-        compatibleSeed?.highWatermark ?? INITIAL_HIGH_WATERMARK,
+        compatibleSeed?.highWatermark ?? Math.max(INITIAL_HIGH_WATERMARK, this.availableLanes * 4 * 1024 * 1024),
         MIN_HIGH_WATERMARK,
         Math.min(MAX_HIGH_WATERMARK, profile.maxWatermark),
       ),
@@ -482,8 +477,7 @@ export class AdaptiveTuner {
   }
 
   setLimits(maxChunk: number, availableLanes: number): boolean {
-    const cappedMax = this.transport === 'blast-nack' ? Math.min(maxChunk, 64 * 1024) : maxChunk;
-    const nextMaxIdx = Math.max(0, ladderIndexAtMost(cappedMax));
+    const nextMaxIdx = Math.max(0, ladderIndexAtMost(maxChunk));
     const lanes = Math.max(1, availableLanes);
     let changed = false;
     if (nextMaxIdx !== this.maxChunkIdx) {
@@ -500,7 +494,7 @@ export class AdaptiveTuner {
     if (lanes !== this.availableLanes) {
       const grew = lanes > this.availableLanes;
       this.availableLanes = lanes;
-      const target = this.pinned?.lanes ? clamp(this.pinned.lanes, 1, lanes) : clamp(this.config.lanes, 1, lanes);
+      const target = this.pinned?.lanes ? clamp(this.pinned.lanes, 1, lanes) : Math.max(this.config.lanes, lanes);
       if (target !== this.config.lanes) {
         this.config = { ...this.config, lanes: target };
         changed = true;

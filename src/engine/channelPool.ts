@@ -142,7 +142,8 @@ export class ChannelPool {
   }
 
   setHighWatermark(bytes: number): void {
-    this.highWatermark = bytes;
+    const minWatermark = Math.max(bytes, this.openLaneCount * 4 * 1024 * 1024);
+    this.highWatermark = minWatermark;
     this.applyThresholds();
     if (this.totalBuffered <= this.resumeLevel) this.handleLow();
   }
@@ -152,9 +153,10 @@ export class ChannelPool {
     const candidates: RTCDataChannel[] = [];
     let best: RTCDataChannel | null = null;
     let lanesSeen = 0;
+    const laneLimit = Number.isFinite(this.activeLanes) ? this.activeLanes : this.lanes.length;
 
     for (const lane of this.lanes) {
-      if (lanesSeen >= this.activeLanes) break;
+      if (lanesSeen >= laneLimit) break;
       const limit = lane.id === '0' ? Math.min(lane.channels.length, this.channelsPerPrimaryLane) : lane.channels.length;
       let laneOpen = false;
       for (let i = 0; i < limit; i++) {

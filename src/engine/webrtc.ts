@@ -742,14 +742,13 @@ export class WarpWebRTCEngine {
         });
       }
 
-      // Pre-spin clean background SCTP lanes for large WebRTC transfers
+      // Pre-spin clean background SCTP lanes for WebRTC transfers
       if (
         plan.transport !== 'lan-turbo' &&
         plan.transport !== 'local-bus' &&
-        file.size >= 16 * 1024 * 1024 &&
         link.telemetry.route !== 'relay'
       ) {
-        const targetExtra = Math.min(this.deviceProfile.maxExtraLanes, link.peerCaps.lanes);
+        const targetExtra = Math.min(this.deviceProfile.maxExtraLanes, link.peerCaps.lanes || 3);
         if (targetExtra > 0) void this.ensureExtraLanes(link, targetExtra);
       }
 
@@ -1299,6 +1298,10 @@ export class WarpWebRTCEngine {
             snap.route,
             snap.rttMs ?? link.pingRttMs,
           );
+          if (snap.route === 'host' && this.isInitiatorFor(link.peerId) && (link.peerCaps.lanes ?? 0) > 0) {
+            const desiredExtra = Math.min(this.deviceProfile.maxExtraLanes, link.peerCaps.lanes);
+            if (desiredExtra > 0) void this.ensureExtraLanes(link, desiredExtra);
+          }
           this.emitHud();
         },
       }),
@@ -1962,6 +1965,10 @@ export class WarpWebRTCEngine {
             });
           }
           void this.probePeerTurboEndpoints(link);
+          const desiredExtra = Math.min(this.deviceProfile.maxExtraLanes, msg.caps.lanes ?? 3);
+          if (desiredExtra > 0 && this.isInitiatorFor(link.peerId) && link.telemetry.route !== 'relay') {
+            void this.ensureExtraLanes(link, desiredExtra);
+          }
         }
         this.callbacks.onRemoteHello?.(link.peerId, link.peerName, msg.deviceKind);
         this.emitHud();

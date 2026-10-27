@@ -56,6 +56,7 @@ export const EngineerHUD: React.FC<EngineerHUDProps> = ({
   onChangeTransportMode,
 }) => {
   const [expanded, setExpanded] = useState(false);
+  const [copiedTurbo, setCopiedTurbo] = useState(false);
   const reduceMotion = useReducedMotion();
 
   useEffect(() => {
@@ -370,9 +371,28 @@ export const EngineerHUD: React.FC<EngineerHUDProps> = ({
               ) : (
                 <div className="calm-row mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-xl p-2.5 text-[11px]">
                   <div className="min-w-0 flex-1 font-mono text-[10px] text-ink-tertiary">
-                    <span className="font-semibold text-ink-secondary">Speed Tip:</span> Run{' '}
-                    <code className="rounded bg-white/10 px-1 py-0.5 text-cyan-ice">npm run turbo</code> on any LAN laptop to bypass browser WebRTC UDP rate caps and achieve 150+ MB/s.
+                    <div>
+                      <span className="font-semibold text-ink-secondary">GitHub Pages Mode:</span> Running Native 6-Lane WebRTC (20–35+ MB/s browser line rate).
+                    </div>
+                    <div className="mt-0.5 text-ink-tertiary">
+                      For <span className="font-semibold text-lime-signal">150–250+ MB/s LAN Turbo</span>: run{' '}
+                      <code className="rounded bg-white/10 px-1 py-0.5 text-cyan-ice">npm run turbo</code> or double-click{' '}
+                      <code className="rounded bg-white/10 px-1 py-0.5 text-cyan-ice">start-turbo.bat</code> on any LAN laptop.
+                    </div>
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (typeof navigator !== 'undefined' && navigator.clipboard) {
+                        void navigator.clipboard.writeText('npm run turbo');
+                        setCopiedTurbo(true);
+                        setTimeout(() => setCopiedTurbo(false), 2000);
+                      }
+                    }}
+                    className="warp-btn warp-btn-subtle shrink-0 rounded-full border border-white/15 bg-white/5 px-2.5 py-1 font-mono text-[10px] text-ink-secondary hover:text-white"
+                  >
+                    {copiedTurbo ? '✓ Copied' : 'Copy npm run turbo'}
+                  </button>
                 </div>
               )}
 
