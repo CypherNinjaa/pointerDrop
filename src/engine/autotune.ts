@@ -137,7 +137,7 @@ export function detectDeviceProfile(
   const tier: DeviceProfile['tier'] =
     cores <= 4 || lowMem ? 'low' : cores >= 8 && (memoryGB === null || memoryGB >= 4) ? 'high' : 'mid';
 
-  const maxExtraLanes = mobile ? (tier === 'low' ? 1 : 2) : tier === 'low' ? 1 : tier === 'mid' ? 2 : 3;
+  const maxExtraLanes = mobile ? (tier === 'low' ? 1 : 2) : tier === 'low' ? 2 : tier === 'mid' ? 3 : 5;
   // Start cleanly at 64 KiB (low SCTP fragment count on Wi-Fi); climb to 128–256 KiB when clean.
   const initialChunk = 64 * 1024;
   let maxWatermark = memoryGB === null ? 16 * MB : memoryGB >= 8 ? 32 * MB : memoryGB >= 4 ? 16 * MB : 8 * MB;
@@ -235,12 +235,34 @@ export function negotiateJointTransferPlan(
   rttMs: number | null,
   preferredMode: TransportMode,
   peerBlastReady: boolean,
+  localBusReady = false,
+  sharedTurboEndpoint: string | null = null,
 ): JointTransferPlan {
   const sMed = sender.networkMedium;
   const rMed = receiverHw?.networkMedium ?? 'unknown';
 
+  let transport: ActiveTransportKind = 'reliable-sctp';
+  if (preferredMode === 'lan-turbo' && sharedTurboEndpoint) {
+    transport = 'lan-turbo';
+  } else if (localBusReady && (preferredMode === 'auto' || preferredMode === 'lan-turbo')) {
+    transport = 'local-bus';
+  } else if (sharedTurboEndpoint && preferredMode === 'auto') {
+    transport = 'lan-turbo';
+  } else if (preferredMode === 'blast-nack' && peerBlastReady) {
+    transport = 'blast-nack';
+  } else if (preferredMode === 'reliable-sctp' || !peerBlastReady) {
+    transport = 'reliable-sctp';
+  } else if (peerBlastReady && route !== 'relay') {
+    // Auto mode: Blast UDP + Selective Reliable Repair avoids dcSCTP rwnd head-of-line stalls on Wi-Fi & WAN!
+    transport = 'blast-nack';
+  }
+
   let topologyLabel = 'P2P Link';
-  if (route === 'relay') {
+  if (transport === 'local-bus') {
+    topologyLabel = 'Zero-Copy Browser Memory Bus (No UDP/DTLS)';
+  } else if (transport === 'lan-turbo') {
+    topologyLabel = 'Unencrypted LAN Turbo TCP (Zero-Copy Pipe)';
+  } else if (route === 'relay') {
     topologyLabel = 'TURN Relayed Path';
   } else if (sMed === 'ethernet' && rMed === 'ethernet') {
     topologyLabel = 'Ethernet ↔ Ethernet (Full-Duplex Wire)';
@@ -254,35 +276,39 @@ export function negotiateJointTransferPlan(
     topologyLabel = 'NAT Reflexive UDP (srflx)';
   }
 
-  let transport: ActiveTransportKind = 'reliable-sctp';
-  if (preferredMode === 'blast-nack' && peerBlastReady) {
-    transport = 'blast-nack';
-  } else if (preferredMode === 'reliable-sctp' || !peerBlastReady) {
-    transport = 'reliable-sctp';
-  } else if (peerBlastReady && route !== 'relay') {
-    // Auto mode: Blast UDP + Selective Reliable Repair avoids dcSCTP rwnd head-of-line stalls on Wi-Fi & WAN!
-    transport = 'blast-nack';
-  }
-
   const bothWiredOrUltraLowRtt =
     (sMed === 'ethernet' && rMed === 'ethernet') || (route === 'host' && rttMs !== null && rttMs <= 2.5);
   const wifiDoubleHop = sMed === 'wifi' && rMed === 'wifi';
   const minCores = Math.min(sender.cores, receiverHw?.cores ?? 4);
 
   const initialChunk =
-    transport === 'blast-nack'
-      ? bothWiredOrUltraLowRtt
-        ? 64 * 1024
-        : 32 * 1024
-      : bothWiredOrUltraLowRtt
-        ? 128 * 1024
-        : 64 * 1024;
+    transport === 'local-bus' || transport === 'lan-turbo'
+      ? 256 * 1024
+      : transport === 'blast-nack'
+        ? bothWiredOrUltraLowRtt
+          ? 64 * 1024
+          : 32 * 1024
+        : bothWiredOrUltraLowRtt
+          ? 128 * 1024
+          : 64 * 1024;
 
-  // Start with 1 lane on Wi-Fi double-hop to avoid multi-PC TX queue bloat; 2 lanes on wired/hybrid high-core links.
   const initialLanes =
-    route === 'relay' || wifiDoubleHop || minCores <= 4 ? 1 : bothWiredOrUltraLowRtt ? 2 : 1;
+    transport === 'local-bus' || transport === 'lan-turbo'
+      ? 1
+      : route === 'relay' || wifiDoubleHop || minCores <= 4
+        ? 1
+        : bothWiredOrUltraLowRtt
+          ? 2
+          : 1;
 
-  const initialWatermark = bothWiredOrUltraLowRtt ? 8 * MB : wifiDoubleHop ? 2 * MB : 4 * MB;
+  const initialWatermark =
+    transport === 'local-bus' || transport === 'lan-turbo'
+      ? 16 * MB
+      : bothWiredOrUltraLowRtt
+        ? 8 * MB
+        : wifiDoubleHop
+          ? 4 * MB
+          : 4 * MB;
   const useSenderRamPreload = fileSize > 0 && fileSize <= sender.senderRamPreloadBudget;
 
   return {
@@ -352,7 +378,9 @@ export function classifyBottleneck(
   if (cw >= 0.28) return 'receiver';
   if (dw >= 0.28) return 'disk';
   const baseRtt = minRttMs > 0 ? minRttMs : s.rttMs;
-  if (qw >= 0.2 && s.rttMs > Math.max(35, baseRtt * 3.2)) return 'bufferbloat';
+  // Normal 802.11ac/ax A-MPDU aggregation produces 35–80 ms active RTT; only trigger
+  // bufferbloat mitigation on severe standing router queue inflation (> 125 ms and > 8x base + 85 ms).
+  if (qw >= 0.32 && s.rttMs > Math.max(125, baseRtt * 8 + 85)) return 'bufferbloat';
   if (qw >= 0.22) return 'network';
   if (s.drainedBytes <= 0) return 'idle';
   return 'cpu';
@@ -390,27 +418,34 @@ export class AdaptiveTuner {
     seed?: Partial<TuneConfig> | null,
     transport: ActiveTransportKind = 'reliable-sctp',
   ) {
-    this.transport = seed?.transport ?? transport;
+    this.transport = transport;
+    // Only inherit seeded chunk/lane values when they come from the same transport family.
+    const compatibleSeed = seed && (!seed.transport || seed.transport === transport) ? seed : null;
     // In Blast-NACK mode, cap chunk size at 64 KiB so each datagram burst is ≤ 55 MTU fragments.
     const effectiveMaxChunk = this.transport === 'blast-nack' ? Math.min(maxChunk, 64 * 1024) : maxChunk;
     this.maxChunkIdx = Math.max(0, ladderIndexAtMost(effectiveMaxChunk));
-    const defaultInitChunk = this.transport === 'blast-nack' ? 32 * 1024 : profile.initialChunk;
-    this.chunkIdx = Math.min(this.maxChunkIdx, ladderIndexAtMost(seed?.chunk ?? defaultInitChunk));
+    const defaultInitChunk =
+      this.transport === 'local-bus' || this.transport === 'lan-turbo'
+        ? 256 * 1024
+        : this.transport === 'blast-nack'
+          ? 32 * 1024
+          : profile.initialChunk;
+    this.chunkIdx = Math.min(this.maxChunkIdx, ladderIndexAtMost(compatibleSeed?.chunk ?? defaultInitChunk));
     this.availableLanes = Math.max(1, availableLanes);
-    const initialLanes = seed?.lanes ?? 1;
+    const initialLanes = compatibleSeed?.lanes ?? 1;
     this.config = {
       chunk: CHUNK_LADDER[this.chunkIdx],
       lanes: clamp(initialLanes, 1, this.availableLanes),
       highWatermark: clamp(
-        seed?.highWatermark ?? INITIAL_HIGH_WATERMARK,
+        compatibleSeed?.highWatermark ?? INITIAL_HIGH_WATERMARK,
         MIN_HIGH_WATERMARK,
         Math.min(MAX_HIGH_WATERMARK, profile.maxWatermark),
       ),
-      channels: clamp(seed?.channels ?? CHANNEL_COUNT, 1, CHANNEL_COUNT),
-      schedule: (seed?.schedule ?? 'least-buffered') as SchedulePolicy,
+      channels: clamp(compatibleSeed?.channels ?? CHANNEL_COUNT, 1, CHANNEL_COUNT),
+      schedule: (compatibleSeed?.schedule ?? 'least-buffered') as SchedulePolicy,
       transport: this.transport,
     };
-    if (seed?.chunk || seed?.lanes) this.lastDecision = 'Seeded from measured link profile';
+    if (compatibleSeed?.chunk || compatibleSeed?.lanes) this.lastDecision = 'Seeded from measured link profile';
   }
 
   pin(pinned: Partial<TuneConfig> | null): void {
@@ -675,12 +710,12 @@ export class AdaptiveTuner {
     const horizon = bloated
       ? 0.12
       : Math.max(0.22 + Math.max(0, this.config.lanes - 1) * 0.06, Math.min(0.6, (6 * baseRtt) / 1000));
-    const rawBytes = Math.max(MIN_HIGH_WATERMARK, bps * horizon);
+    const rawBytes = Math.max(bloated ? 2 * MB : MIN_HIGH_WATERMARK, bps * horizon);
     const quantStep = rawBytes < 2 * MB ? 512 * 1024 : MB;
     const target = clamp(
       Math.ceil(rawBytes / quantStep) * quantStep,
       MIN_HIGH_WATERMARK,
-      bloated ? Math.min(4 * MB, this.profile.maxWatermark) : Math.min(MAX_HIGH_WATERMARK, this.profile.maxWatermark),
+      bloated ? Math.min(2 * MB, this.profile.maxWatermark) : Math.min(MAX_HIGH_WATERMARK, this.profile.maxWatermark),
     );
     const current = this.config.highWatermark;
     if (!bloated && Math.abs(target - current) / Math.max(1, current) < 0.2) return false;

@@ -148,12 +148,22 @@ export const TransferQueue: React.FC<TransferQueueProps> = ({
               <div className="mt-2 flex flex-wrap items-center gap-1.5 font-mono text-[10px] text-ink-tertiary">
                 <span
                   className={`rounded border px-1.5 py-0.5 ${
-                    tr.transport === 'blast-nack'
-                      ? 'border-lime-signal/35 bg-lime-signal/10 text-lime-signal'
-                      : 'border-cyan-ice/30 bg-cyan-warp/12 text-cyan-ice'
+                    tr.transport === 'lan-turbo'
+                      ? 'border-lime-signal/60 bg-lime-signal/20 text-lime-signal font-semibold'
+                      : tr.transport === 'local-bus'
+                        ? 'border-purple-400/50 bg-purple-500/15 text-purple-300 font-semibold'
+                        : tr.transport === 'blast-nack'
+                          ? 'border-lime-signal/35 bg-lime-signal/10 text-lime-signal'
+                          : 'border-cyan-ice/30 bg-cyan-warp/12 text-cyan-ice'
                   }`}
                 >
-                  {tr.transport === 'blast-nack' ? 'Blast+NACK' : 'Rel-SCTP'}
+                  {tr.transport === 'lan-turbo'
+                    ? '⚡ LAN Turbo'
+                    : tr.transport === 'local-bus'
+                      ? '⚡ Memory Bus'
+                      : tr.transport === 'blast-nack'
+                        ? 'Blast+NACK'
+                        : 'Rel-SCTP'}
                 </span>
                 <span className="rounded border border-white/10 bg-black/35 px-1.5 py-0.5">
                   H={tr.entropy.toFixed(2)} b/B

@@ -254,6 +254,10 @@ interface SendJob {
   forceBridge: boolean;
   compress: boolean;
   transport: ActiveTransportKind;
+  turboEndpoint: string | null;
+  localBusToken: string | null;
+  ignoreSeed: boolean;
+  abortCtrl: AbortController | null;
   creditWindow: number;
   creditedBytes: number;
   creditWaiters: Array<() => void>;
@@ -582,8 +586,258 @@ async function drainRepairQueue(
   return { queueMs, diskMs, lz4Ms };
 }
 
+async function runLocalBusSend(job: SendJob, link: LinkState): Promise<void> {
+  const token = job.localBusToken!;
+  const bc = new BroadcastChannel(`warp-data-bus:${token}`);
+  const totalLimit = job.file ? job.file.size : (job.syntheticBytes ?? Number.POSITIVE_INFINITY);
+  let useLz4 = job.compress && codec !== null;
+  const tuner = new AdaptiveTuner(deviceProfile, MAX_CHUNK, 1, null, 'local-bus');
+  if (job.pinned) tuner.pin({ ...job.pinned, transport: 'local-bus' });
+  tuner.phase = 'settled';
+  tuner.lastDecision = 'Zero-Copy Browser Memory Bus active (BroadcastChannel)';
+
+  syncTuneToPoolOrBridge(link, tuner.config, 'local-bus', false, tuner.config.highWatermark);
+
+  const startedAt = performance.now();
+  const stopDeadline = job.durationMs ? startedAt + job.durationMs : Number.POSITIVE_INFINITY;
+  let totalCreditMs = 0;
+  let totalDiskMs = 0;
+  let totalLz4Ms = 0;
+  let bytesSinceYield = 0;
+  let macroOffset = 0;
+  let pendingMacro: Promise<ArrayBuffer> | null = totalLimit > 0 ? readJobMacro(job, 0, totalLimit) : null;
+
+  try {
+    outer: while (macroOffset < totalLimit && pendingMacro) {
+      if (job.cancelled || performance.now() >= stopDeadline) break;
+      const d0 = performance.now();
+      const macroBuf = await pendingMacro;
+      if (job.file !== null) totalDiskMs += performance.now() - d0;
+      if (macroBuf.byteLength === 0) throw new Error('Source file shrank or became unreadable');
+      const nextMacroOffset = macroOffset + macroBuf.byteLength;
+      pendingMacro =
+        nextMacroOffset < totalLimit && performance.now() < stopDeadline
+          ? readJobMacro(job, nextMacroOffset, totalLimit)
+          : null;
+
+      let innerOffset = 0;
+      while (innerOffset < macroBuf.byteLength) {
+        if (job.cancelled) return;
+        if (performance.now() >= stopDeadline) break outer;
+
+        while (!job.cancelled && job.userPaused) {
+          await new Promise<void>((r) => job.pauseWaiters.push(r));
+        }
+        if (Number.isFinite(job.creditWindow)) {
+          while (!job.cancelled && job.rawBytes - job.creditedBytes >= job.creditWindow) {
+            const c0 = performance.now();
+            await new Promise<void>((r) => job.creditWaiters.push(r));
+            totalCreditMs += performance.now() - c0;
+          }
+        }
+        if (job.cancelled) return;
+        if (performance.now() >= stopDeadline) break outer;
+
+        const chunkLen = Math.min(256 * 1024, macroBuf.byteLength - innerOffset);
+        const raw = new Uint8Array(macroBuf, innerOffset, chunkLen);
+        const fileOffset = macroOffset + innerOffset;
+        job.hasher.update(fileOffset, raw);
+
+        let frame: ArrayBuffer;
+        if (useLz4 && codec) {
+          const l0 = performance.now();
+          const comp = codec.compressFrame(raw, FRAME_HEADER_BYTES);
+          totalLz4Ms += performance.now() - l0;
+          if (comp.byteLength < FRAME_HEADER_BYTES + raw.byteLength * 0.96) {
+            writeFrameHeader(comp, fileOffset, true);
+            frame = comp;
+          } else {
+            frame = encodeFrame(fileOffset, raw, false);
+          }
+        } else {
+          frame = encodeFrame(fileOffset, raw, false);
+        }
+
+        bc.postMessage(frame);
+        innerOffset += chunkLen;
+        job.rawBytes = fileOffset + chunkLen;
+        job.wireBytes += frame.byteLength;
+
+        bytesSinceYield += chunkLen;
+        if (bytesSinceYield >= 4 * 1024 * 1024) {
+          bytesSinceYield = 0;
+          await new Promise((r) => setTimeout(r, 0));
+        }
+
+        if (useLz4 && job.rawBytes >= 2 * 1024 * 1024 && job.rawBytes / job.wireBytes < 1.05) {
+          useLz4 = false;
+        }
+        const elapsed = Math.max(1, performance.now() - startedAt);
+        tuner.drainBps = (job.wireBytes * 1000) / elapsed;
+        emitSendProgress(job, tuner, useLz4);
+      }
+      macroOffset = nextMacroOffset;
+    }
+  } finally {
+    bc.close();
+  }
+
+  if (job.cancelled) return;
+  const elapsedMs = Math.max(1, performance.now() - startedAt);
+  tuner.drainBps = (job.wireBytes * 1000) / elapsedMs;
+  emitSendProgress(job, tuner, useLz4, true);
+  post({
+    type: 'send-drained',
+    transferId: job.id,
+    rawBytes: job.rawBytes,
+    wireBytes: job.wireBytes,
+    elapsedMs,
+    queueWaitMs: 0,
+    creditWaitMs: totalCreditMs,
+    diskWaitMs: totalDiskMs,
+    lz4Ms: totalLz4Ms,
+    retransmittedBlocks: 0,
+    hash: job.hasher.digestHex(),
+    finalTuner: tuner.snapshot(useLz4),
+  });
+}
+
+async function runTurboSend(job: SendJob, link: LinkState): Promise<void> {
+  const endpoint = job.turboEndpoint!.replace(/\/+$/, '');
+  const ctrl = new AbortController();
+  job.abortCtrl = ctrl;
+
+  const tuner = new AdaptiveTuner(deviceProfile, MAX_CHUNK, 1, null, 'lan-turbo');
+  tuner.phase = 'settled';
+  tuner.bottleneck = 'network';
+  tuner.lastDecision = 'Unencrypted LAN Turbo TCP Cut-Through Pipe active';
+  syncTuneToPoolOrBridge(link, tuner.config, 'lan-turbo', false, tuner.config.highWatermark);
+
+  const startedAt = performance.now();
+  let totalDiskMs = 0;
+
+  if (job.file !== null) {
+    // Real file transfer: single uninterrupted zero-copy HTTP PUT stream + parallel 128-bit block hash
+    const file = job.file;
+    const pipeUrl = `${endpoint}/warp-turbo/pipe/${encodeURIComponent(job.id)}?role=put`;
+
+    const progressTimer = setInterval(() => {
+      if (job.cancelled) return;
+      const shown = Math.max(job.rawBytes, Math.min(file.size, job.creditedBytes));
+      job.rawBytes = shown;
+      job.wireBytes = shown;
+      const elapsed = Math.max(1, performance.now() - startedAt);
+      tuner.drainBps = (shown * 1000) / elapsed;
+      emitSendProgress(job, tuner, false);
+    }, PROGRESS_INTERVAL_MS);
+
+    try {
+      const putPromise = fetch(pipeUrl, {
+        method: 'PUT',
+        headers: { 'X-Warp-Size': String(file.size) },
+        body: file,
+        signal: ctrl.signal,
+        cache: 'no-store',
+      });
+
+      const hashPromise = (async () => {
+        for (let off = 0; off < file.size && !job.cancelled; off += DISK_MACRO_BYTES) {
+          const d0 = performance.now();
+          const buf = await readJobMacro(job, off, file.size);
+          totalDiskMs += performance.now() - d0;
+          job.hasher.update(off, new Uint8Array(buf));
+        }
+      })();
+
+      const [putRes] = await Promise.all([putPromise, hashPromise]);
+      if (!putRes.ok && !job.cancelled) {
+        throw new Error(`LAN Turbo pipe HTTP ${putRes.status}`);
+      }
+    } finally {
+      clearInterval(progressTimer);
+    }
+
+    if (job.cancelled) return;
+    job.rawBytes = file.size;
+    job.wireBytes = file.size;
+  } else {
+    // Benchmark mode: stream 32 MiB zero-copy Blob segments until `durationMs` completes, then send clean 204 EOF
+    const synthBuf = getSyntheticMacro(job.compressibleBench);
+    const synthView = new Uint8Array(synthBuf);
+    const SEG_REPEATS = 4; // 4 × 8 MiB = 32 MiB per TCP cut-through segment
+    const SEG_BYTES = SEG_REPEATS * synthBuf.byteLength;
+    const segBlob = new Blob(Array.from({ length: SEG_REPEATS }, () => synthBuf));
+    const stopDeadline = job.durationMs ? startedAt + job.durationMs : startedAt + 3_500;
+
+    let seg = 0;
+    while (!job.cancelled && performance.now() < stopDeadline) {
+      const segUrl = `${endpoint}/warp-turbo/pipe/${encodeURIComponent(job.id)}-s${seg}?role=put`;
+      const putPromise = fetch(segUrl, {
+        method: 'PUT',
+        headers: { 'X-Warp-Size': String(SEG_BYTES) },
+        body: segBlob,
+        signal: ctrl.signal,
+        cache: 'no-store',
+      });
+      const baseOff = seg * SEG_BYTES;
+      for (let m = 0; m < SEG_REPEATS; m++) {
+        job.hasher.update(baseOff + m * synthBuf.byteLength, synthView);
+      }
+      const res = await putPromise;
+      if (!res.ok && !job.cancelled) {
+        throw new Error(`LAN Turbo benchmark HTTP ${res.status}`);
+      }
+      seg++;
+      job.rawBytes += SEG_BYTES;
+      job.wireBytes += SEG_BYTES;
+      const elapsed = Math.max(1, performance.now() - startedAt);
+      tuner.drainBps = (job.wireBytes * 1000) / elapsed;
+      emitSendProgress(job, tuner, false);
+    }
+
+    if (!job.cancelled) {
+      const eofUrl = `${endpoint}/warp-turbo/pipe/${encodeURIComponent(job.id)}-s${seg}?role=put`;
+      await fetch(eofUrl, {
+        method: 'PUT',
+        headers: { 'X-Warp-Eof': '1' },
+        body: new Uint8Array(0),
+        cache: 'no-store',
+      }).catch(() => undefined);
+    }
+  }
+
+  if (job.cancelled) return;
+  const elapsedMs = Math.max(1, performance.now() - startedAt);
+  tuner.drainBps = (job.wireBytes * 1000) / elapsedMs;
+  tuner.lastDecision = `LAN Turbo TCP · ${((job.wireBytes / (1024 * 1024)) / (elapsedMs / 1000)).toFixed(1)} MB/s`;
+  emitSendProgress(job, tuner, false, true);
+  post({
+    type: 'send-drained',
+    transferId: job.id,
+    rawBytes: job.rawBytes,
+    wireBytes: job.wireBytes,
+    elapsedMs,
+    queueWaitMs: 0,
+    creditWaitMs: 0,
+    diskWaitMs: totalDiskMs,
+    lz4Ms: 0,
+    retransmittedBlocks: 0,
+    hash: job.hasher.digestHex(),
+    finalTuner: tuner.snapshot(false),
+  });
+}
+
 async function runSend(job: SendJob): Promise<void> {
   const link = getLink(job.linkId);
+  if (job.transport === 'local-bus' && job.localBusToken) {
+    await runLocalBusSend(job, link);
+    return;
+  }
+  if (job.transport === 'lan-turbo' && job.turboEndpoint) {
+    await runTurboSend(job, link);
+    return;
+  }
+
   const isBench = job.file === null;
   const totalLimit = job.file ? job.file.size : (job.syntheticBytes ?? Number.POSITIVE_INFINITY);
   let useLz4 = job.compress && codec !== null;
@@ -603,7 +857,7 @@ async function runSend(job: SendJob): Promise<void> {
     deviceProfile,
     maxChunkInit,
     openLanesFor(link, effectiveTransport, job.forceBridge),
-    link.seed,
+    job.ignoreSeed ? null : link.seed,
     effectiveTransport,
   );
   if (job.pinned) tuner.pin(job.pinned);
@@ -855,6 +1109,9 @@ interface RecvJob {
   targetBytes: number;
   compress: boolean;
   transport: ActiveTransportKind;
+  turboEndpoint: string | null;
+  localBusChannel: BroadcastChannel | null;
+  abortCtrl: AbortController | null;
   bench: boolean;
   saveHandle: FileSystemFileHandle | null;
   sink: DiskSink | null;
@@ -917,10 +1174,30 @@ function drainRxQueue(): void {
   }
 }
 
+function cleanupRecvTransports(job: RecvJob): void {
+  if (job.localBusChannel) {
+    try {
+      job.localBusChannel.close();
+    } catch {
+      // Ignore.
+    }
+    job.localBusChannel = null;
+  }
+  if (job.abortCtrl) {
+    try {
+      job.abortCtrl.abort();
+    } catch {
+      // Ignore.
+    }
+    job.abortCtrl = null;
+  }
+}
+
 function failRecv(job: RecvJob, message: string): void {
   if (job.failed || job.finished) return;
   job.failed = true;
   if (job.benchStopTimer !== null) clearTimeout(job.benchStopTimer);
+  cleanupRecvTransports(job);
   recvJobs.delete(job.id);
   if (recvByLink.get(job.linkId) === job.id) recvByLink.delete(job.linkId);
   void job.sink?.abort();
@@ -1094,6 +1371,181 @@ function ingest(job: RecvJob, frame: ArrayBuffer): void {
   checkRecvCompletion(job);
 }
 
+function ingestRawBytesAt(job: RecvJob, offset: number, bytes: Uint8Array, checkComplete = true): void {
+  if (job.failed || job.finished || bytes.byteLength === 0) return;
+  const sink = job.sink!;
+  if (!job.bench && offset + bytes.byteLength > job.size) {
+    failRecv(job, `Stream at ${offset} overruns file size ${job.size}`);
+    return;
+  }
+
+  if (job.rawBytes === 0) job.startedAt = performance.now();
+
+  let pos = 0;
+  let newlyAccepted = 0;
+  while (pos < bytes.byteLength) {
+    const subOffset = offset + pos;
+    const subLen = Math.min(BLOCK_BYTES, bytes.byteLength - pos);
+    const blockIdx = Math.floor(subOffset / BLOCK_BYTES);
+    const isFirst = subOffset % BLOCK_BYTES === 0 ? job.bitmap.markBlock(blockIdx) : true;
+    if (isFirst) {
+      const subSlice = bytes.subarray(pos, pos + subLen);
+      job.hasher.update(subOffset, subSlice);
+      newlyAccepted += subLen;
+
+      const t0 = performance.now();
+      const result = sink.write(subOffset, subSlice);
+      if (result) {
+        job.pendingWriteBytes += subLen;
+        if (job.pendingWriteBytes > job.maxPendingWriteBytes) {
+          job.maxPendingWriteBytes = job.pendingWriteBytes;
+        }
+        job.inflight.add(result);
+        result.then(
+          () => {
+            job.inflight.delete(result);
+            job.pendingWriteBytes = Math.max(0, job.pendingWriteBytes - subLen);
+            job.writeMs += performance.now() - t0;
+            job.persistedBytes += subLen;
+            maybeEmitCredit(job);
+            if (!job.bench) checkRecvCompletion(job);
+          },
+          (error: unknown) => failRecv(job, `Disk write failed: ${String(error)}`),
+        );
+      } else {
+        job.writeMs += performance.now() - t0;
+        job.persistedBytes += subLen;
+        maybeEmitCredit(job);
+      }
+    }
+    pos += subLen;
+  }
+
+  job.rawBytes += newlyAccepted;
+  job.wireBytes += bytes.byteLength;
+
+  const now = performance.now();
+  if (now - job.lastProgress >= PROGRESS_INTERVAL_MS || job.rawBytes >= job.targetBytes) {
+    job.lastProgress = now;
+    post({
+      type: 'recv-progress',
+      transferId: job.id,
+      rawBytes: job.rawBytes,
+      wireBytes: job.wireBytes,
+      persistedBytes: job.persistedBytes,
+      pendingWriteBytes: job.pendingWriteBytes,
+      pendingWriteCount: job.inflight.size,
+      writeMs: job.writeMs,
+      sink: sink.kind,
+    });
+  }
+  if (checkComplete) checkRecvCompletion(job);
+}
+
+async function streamReaderAligned(
+  job: RecvJob,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  startOffset: number,
+  checkComplete: boolean,
+): Promise<number> {
+  let offset = startOffset;
+  const carry = new Uint8Array(BLOCK_BYTES);
+  let carryLen = 0;
+
+  while (!job.failed && !job.finished) {
+    if (job.pendingWriteBytes >= 16 * 1024 * 1024 && job.inflight.size > 0) {
+      await Promise.race(job.inflight);
+    }
+    const { value, done } = await reader.read();
+    if (done || !value || value.byteLength === 0) break;
+
+    let vPos = 0;
+    if (carryLen > 0) {
+      const need = Math.min(BLOCK_BYTES - carryLen, value.byteLength);
+      carry.set(value.subarray(0, need), carryLen);
+      carryLen += need;
+      vPos += need;
+      if (carryLen === BLOCK_BYTES) {
+        ingestRawBytesAt(job, offset, job.sink?.synchronous ? carry : carry.slice(), checkComplete);
+        offset += BLOCK_BYTES;
+        carryLen = 0;
+        if (job.failed || job.finished) return offset;
+      }
+    }
+
+    const rem = value.byteLength - vPos;
+    const alignedLen = rem & ~(BLOCK_BYTES - 1);
+    if (alignedLen > 0) {
+      ingestRawBytesAt(job, offset, value.subarray(vPos, vPos + alignedLen), checkComplete);
+      offset += alignedLen;
+      vPos += alignedLen;
+      if (job.failed || job.finished) return offset;
+    }
+
+    const tailLen = value.byteLength - vPos;
+    if (tailLen > 0) {
+      carry.set(value.subarray(vPos), 0);
+      carryLen = tailLen;
+    }
+  }
+
+  if (carryLen > 0 && !job.failed && !job.finished) {
+    ingestRawBytesAt(job, offset, carry.slice(0, carryLen), checkComplete);
+    offset += carryLen;
+  }
+  return offset;
+}
+
+async function runTurboRecv(job: RecvJob, endpoint: string): Promise<void> {
+  const ep = endpoint.replace(/\/+$/, '');
+  try {
+    if (!job.bench) {
+      const pipeUrl = `${ep}/warp-turbo/pipe/${encodeURIComponent(job.id)}?role=get`;
+      const res = await fetch(pipeUrl, {
+        method: 'GET',
+        signal: job.abortCtrl?.signal,
+        cache: 'no-store',
+      });
+      if (!res.ok || !res.body) {
+        throw new Error(`LAN Turbo GET failed (HTTP ${res.status})`);
+      }
+      await streamReaderAligned(job, res.body.getReader(), 0, true);
+      if (!job.failed && !job.finished) {
+        if (job.rawBytes >= job.targetBytes) checkRecvCompletion(job);
+        else failRecv(job, `LAN Turbo stream truncated (${job.rawBytes} / ${job.targetBytes} bytes)`);
+      }
+    } else {
+      let offset = 0;
+      let seg = 0;
+      while (!job.failed && !job.finished) {
+        const segUrl = `${ep}/warp-turbo/pipe/${encodeURIComponent(job.id)}-s${seg}?role=get`;
+        const res = await fetch(segUrl, {
+          method: 'GET',
+          signal: job.abortCtrl?.signal,
+          cache: 'no-store',
+        });
+        if (res.status === 204 || res.headers.get('x-warp-eof') === '1') {
+          break;
+        }
+        if (!res.ok || !res.body) {
+          throw new Error(`LAN Turbo benchmark GET failed (HTTP ${res.status})`);
+        }
+        offset = await streamReaderAligned(job, res.body.getReader(), offset, false);
+        seg++;
+      }
+      if (!job.failed && !job.finished) {
+        job.targetBytes = offset;
+        job.bitmap.setFinalByteSize(offset);
+        void finalizeBenchRecv(job);
+      }
+    }
+  } catch (error) {
+    if (!job.failed && !job.finished) {
+      failRecv(job, `LAN Turbo receive error: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
 function checkRecvCompletion(job: RecvJob): void {
   if (job.finished || job.failed) return;
   const bitmapDone = Number.isFinite(job.targetBytes)
@@ -1119,6 +1571,7 @@ async function finalizeBenchRecv(job: RecvJob): Promise<void> {
   if (job.finished || job.failed) return;
   job.finished = true;
   if (job.benchStopTimer !== null) clearTimeout(job.benchStopTimer);
+  cleanupRecvTransports(job);
   if (recvByLink.get(job.linkId) === job.id) recvByLink.delete(job.linkId);
   const sinkKind = job.sink?.kind ?? 'discard';
   try {
@@ -1155,6 +1608,7 @@ async function finalizeBenchRecv(job: RecvJob): Promise<void> {
 async function finalizeRecv(job: RecvJob): Promise<void> {
   if (job.finished || job.failed) return;
   job.finished = true;
+  cleanupRecvTransports(job);
   if (recvByLink.get(job.linkId) === job.id) recvByLink.delete(job.linkId);
   const sink = job.sink!;
   const sinkKind = sink.kind;
@@ -1207,6 +1661,12 @@ async function finalizeRecv(job: RecvJob): Promise<void> {
 }
 
 async function startRecv(message: Extract<ToWorker, { type: 'recv-start' }>): Promise<void> {
+  const localBusChannel =
+    message.transport === 'local-bus' && message.localBusToken
+      ? new BroadcastChannel(`warp-data-bus:${message.localBusToken}`)
+      : null;
+  const abortCtrl = message.transport === 'lan-turbo' && message.turboEndpoint ? new AbortController() : null;
+
   const job: RecvJob = {
     id: message.transferId,
     linkId: message.linkId,
@@ -1216,6 +1676,9 @@ async function startRecv(message: Extract<ToWorker, { type: 'recv-start' }>): Pr
     targetBytes: message.size,
     compress: message.compress,
     transport: message.transport,
+    turboEndpoint: message.turboEndpoint ?? null,
+    localBusChannel,
+    abortCtrl,
     bench: message.bench,
     saveHandle: message.saveHandle,
     sink: null,
@@ -1268,6 +1731,15 @@ async function startRecv(message: Extract<ToWorker, { type: 'recv-start' }>): Pr
     message.windowOverride && message.windowOverride > 0 ? message.windowOverride : defaultWin;
   job.creditStep = Math.min(CREDIT_STEP_BYTES, Math.max(256 * 1024, Math.floor(job.creditWindow / 4)));
 
+  if (localBusChannel) {
+    localBusChannel.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
+      if (ev.data instanceof ArrayBuffer) enqueueIncoming(job.linkId, ev.data);
+    };
+  }
+  if (job.transport === 'lan-turbo' && job.turboEndpoint) {
+    void runTurboRecv(job, job.turboEndpoint);
+  }
+
   post({ type: 'recv-ready', transferId: job.id, window: job.creditWindow, sink: job.sink.kind });
 
   const backlog = job.backlog ?? [];
@@ -1291,6 +1763,11 @@ function cancelTransfer(transferId: string, notify: string | null): void {
   const send = sendJobs.get(transferId);
   if (send) {
     send.cancelled = true;
+    send.abortCtrl?.abort();
+    if (send.turboEndpoint) {
+      const ep = send.turboEndpoint.replace(/\/+$/, '');
+      void fetch(`${ep}/warp-turbo/pipe/${encodeURIComponent(transferId)}`, { method: 'DELETE' }).catch(() => undefined);
+    }
     sendJobs.delete(transferId);
     releaseJobPause(send);
     releaseCredits(send);
@@ -1305,6 +1782,7 @@ function cancelTransfer(transferId: string, notify: string | null): void {
     else {
       recv.failed = true;
       if (recv.benchStopTimer !== null) clearTimeout(recv.benchStopTimer);
+      cleanupRecvTransports(recv);
       recvJobs.delete(transferId);
       if (recvByLink.get(recv.linkId) === transferId) recvByLink.delete(recv.linkId);
       void recv.sink?.abort();
@@ -1439,6 +1917,10 @@ scope.addEventListener('message', (event) => {
         forceBridge: Boolean(message.forceBridge),
         compress: message.compress,
         transport: message.transport,
+        turboEndpoint: message.turboEndpoint ?? null,
+        localBusToken: message.localBusToken ?? null,
+        ignoreSeed: Boolean(message.ignoreSeed),
+        abortCtrl: null,
         creditWindow: message.creditWindow,
         creditedBytes: 0,
         creditWaiters: [],
@@ -1572,7 +2054,7 @@ scope.addEventListener('message', (event) => {
           setTimeout(() => {
             if (!job.finished && !job.failed) performFinalBlastAudit(job);
           }, 12);
-        } else {
+        } else if (job.transport !== 'lan-turbo') {
           checkRecvCompletion(job);
         }
         if (!job.finished && job.benchStopTimer === null) {

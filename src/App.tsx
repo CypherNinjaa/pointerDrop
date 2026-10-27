@@ -65,6 +65,10 @@ const INITIAL_HUD: TelemetryHUDState = {
   opfsSyncReady: false,
   secureContext: typeof window !== 'undefined' ? Boolean(window.isSecureContext) : true,
   degraded: false,
+  turboAvailable: false,
+  localBusAvailable: false,
+  turboEndpoints: [],
+  peerLanTurboUrl: null,
 };
 
 type CompactSection = 'radar' | 'pair' | 'transfers' | 'settings';

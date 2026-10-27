@@ -108,6 +108,20 @@ export interface BenchmarkSuiteSummary {
   bestRun: BenchmarkRunResult | null;
   recommendedConfig: Partial<TuneConfig> | null;
   allHashesVerified: boolean;
+  udpRateLimited: boolean;
+}
+
+export function formatTransportShort(t: ActiveTransportKind): string {
+  switch (t) {
+    case 'lan-turbo':
+      return 'LAN Turbo';
+    case 'local-bus':
+      return 'Memory Bus';
+    case 'blast-nack':
+      return 'Blast+NACK';
+    case 'reliable-sctp':
+      return 'Rel-SCTP';
+  }
 }
 
 export function buildPresetSteps(
@@ -118,6 +132,8 @@ export function buildPresetSteps(
   opfsSyncAvailable: boolean,
   nativeWorkerSupported = true,
   blastSupported = true,
+  lanTurboAvailable = false,
+  localBusAvailable = false,
 ): BenchmarkStepSpec[] {
   const sctpCap = maxSctpMessageSize && maxSctpMessageSize > 0 ? maxSctpMessageSize : 256 * 1024 + 64;
   const validChunks = CHUNK_LADDER.filter((c) => c + FRAME_HEADER_BYTES <= sctpCap);
@@ -177,6 +193,28 @@ export function buildPresetSteps(
         transport: 'reliable-sctp',
         pinned: null,
       });
+      if (lanTurboAvailable) {
+        steps.push({
+          label: 'LAN Turbo TCP (Unencrypted Zero-Copy)',
+          durationMs: 2_800,
+          compressible: false,
+          compress: false,
+          preferredSink: 'discard',
+          transport: 'lan-turbo',
+          pinned: null,
+        });
+      }
+      if (localBusAvailable) {
+        steps.push({
+          label: 'Zero-Copy Memory Bus (Same Browser)',
+          durationMs: 2_000,
+          compressible: false,
+          compress: false,
+          preferredSink: 'discard',
+          transport: 'local-bus',
+          pinned: null,
+        });
+      }
       return steps;
     }
 
@@ -233,6 +271,7 @@ export function buildPresetSteps(
           compressible: false,
           compress: false,
           preferredSink: 'discard',
+          transport: 'reliable-sctp',
           pinned: { channels: 4, lanes: 1 },
         },
         {
@@ -241,6 +280,7 @@ export function buildPresetSteps(
           compressible: false,
           compress: false,
           preferredSink: 'discard',
+          transport: 'reliable-sctp',
           pinned: { channels: 1, lanes: 1, schedule: 'least-buffered' },
         },
         {
@@ -249,6 +289,7 @@ export function buildPresetSteps(
           compressible: false,
           compress: false,
           preferredSink: 'discard',
+          transport: 'reliable-sctp',
           pinned: { channels: 2, lanes: 1, schedule: 'least-buffered' },
         },
         {
@@ -257,6 +298,7 @@ export function buildPresetSteps(
           compressible: false,
           compress: false,
           preferredSink: 'discard',
+          transport: 'reliable-sctp',
           pinned: { channels: 4, lanes: 1, schedule: 'least-buffered' },
         },
         {
@@ -265,6 +307,7 @@ export function buildPresetSteps(
           compressible: false,
           compress: false,
           preferredSink: 'discard',
+          transport: 'reliable-sctp',
           pinned: { channels: 4, lanes: 1, schedule: 'round-robin' },
         },
       ];
@@ -275,6 +318,7 @@ export function buildPresetSteps(
           compressible: false,
           compress: false,
           preferredSink: 'discard',
+          transport: 'reliable-sctp',
           pinned: { channels: 4, lanes: maxLanes, schedule: 'least-buffered' },
         });
       }
@@ -291,6 +335,7 @@ export function buildPresetSteps(
             compressible: false,
             compress: false,
             preferredSink: 'discard',
+            transport: 'reliable-sctp',
           },
           {
             label: 'Bridge · Autotuned (Worker DC unsupported)',
@@ -298,6 +343,7 @@ export function buildPresetSteps(
             compressible: false,
             compress: false,
             preferredSink: 'discard',
+            transport: 'reliable-sctp',
             forceBridge: false,
           },
           {
@@ -306,6 +352,7 @@ export function buildPresetSteps(
             compressible: false,
             compress: false,
             preferredSink: 'discard',
+            transport: 'reliable-sctp',
             forceBridge: false,
             pinned: {
               chunk: Math.min(64 * 1024, validChunks[validChunks.length - 1] ?? 64 * 1024),
@@ -323,6 +370,7 @@ export function buildPresetSteps(
           compressible: false,
           compress: false,
           preferredSink: 'discard',
+          transport: 'reliable-sctp',
         },
         {
           label: 'Worker-Owned DataChannels',
@@ -330,6 +378,7 @@ export function buildPresetSteps(
           compressible: false,
           compress: false,
           preferredSink: 'discard',
+          transport: 'reliable-sctp',
           forceBridge: false,
         },
         {
@@ -338,6 +387,7 @@ export function buildPresetSteps(
           compressible: false,
           compress: false,
           preferredSink: 'discard',
+          transport: 'reliable-sctp',
           forceBridge: true,
         },
       ];
@@ -440,6 +490,17 @@ export function summarizeBenchmarkSuite(
       }
     : null;
 
+  const webrtcRuns = sampleSet.filter(
+    (r) => (r.transport === 'blast-nack' || r.transport === 'reliable-sctp') && r.compressionRatio <= 1.05,
+  );
+  let bestWebrtcMBps = 0;
+  let webrtcSocketStalled = false;
+  for (const r of webrtcRuns) {
+    if (r.appMBps > bestWebrtcMBps) bestWebrtcMBps = r.appMBps;
+    if (r.queueWaitPct >= 30 || (r.ctrlPingLoadedMs ?? 0) >= 85) webrtcSocketStalled = true;
+  }
+  const udpRateLimited = webrtcRuns.length > 0 && bestWebrtcMBps < 6.0 && webrtcSocketStalled;
+
   return {
     preset,
     runs,
@@ -448,6 +509,7 @@ export function summarizeBenchmarkSuite(
     bestRun,
     recommendedConfig,
     allHashesVerified: sampleSet.every((r) => r.hashMatch && r.complete),
+    udpRateLimited,
   };
 }
 
@@ -458,10 +520,15 @@ export function formatSuiteMarkdownReport(summary: BenchmarkSuiteSummary): strin
     `- Median App Throughput: **${summary.medianMBps.toFixed(1)} MB/s** (±${summary.p95VariationPct}% variation)`,
     `- Integrity Verification: **${summary.allHashesVerified ? 'PASS (100% 128-bit block hashes matched)' : 'WARN (mismatch/incomplete)'}**`,
   ];
+  if (summary.udpRateLimited) {
+    lines.push(
+      `- Transport Advisory: **Browser WebRTC UDP rate-cap detected (< 6 MB/s)** — run \`npm run turbo\` to switch to Unencrypted Zero-Copy LAN Turbo TCP (100–300+ MB/s).`,
+    );
+  }
   if (summary.bestRun) {
     const b = summary.bestRun;
     lines.push(
-      `- Best Config: **${b.transport === 'blast-nack' ? 'Blast UDP + Bitmap NACK' : 'Reliable SCTP'}** · **${Math.round(b.chunkSize / 1024)} KiB** chunk · **${b.activeLanes} lane(s)** · **${b.activeChannels} ch (${b.schedule})** · **${formatBytes(b.highWatermark, 0)} WM**`,
+      `- Best Config: **${formatTransportShort(b.transport)}** · **${Math.round(b.chunkSize / 1024)} KiB** chunk · **${b.activeLanes} lane(s)** · **${b.activeChannels} ch (${b.schedule})** · **${formatBytes(b.highWatermark, 0)} WM**`,
       `- Route Evidence: \`${b.candidatePairLabel}\` (minRTT ${b.minRttMs ?? '—'} ms, RTT ${b.rttMs ?? '—'} ms, Bloat +${b.bloatMs} ms, Loaded Ping ${b.ctrlPingLoadedMs ?? '—'} ms)`,
       `- Endpoints: \`${b.senderEnv}\` → \`${b.receiverEnv}\` (${b.networkTag}, ${b.powerTag})`,
     );
@@ -473,7 +540,7 @@ export function formatSuiteMarkdownReport(summary: BenchmarkSuiteSummary): strin
   );
   for (const r of summary.runs) {
     const writeStr = r.receiverWriteMBps !== null ? `${r.sink} (${r.receiverWriteMBps.toFixed(0)} MB/s)` : r.sink;
-    const modeLabel = r.transport === 'blast-nack' ? 'Blast+NACK' : 'Rel-SCTP';
+    const modeLabel = formatTransportShort(r.transport);
     lines.push(
       `| ${r.warmup ? `[Warm] ${r.label}` : r.label} | ${modeLabel} | \`${r.candidatePairLabel}\` | **${r.appMBps.toFixed(1)}** | ${r.wireMBps.toFixed(1)} | ${r.statsWireMBps.toFixed(1)} | ${Math.round(r.chunkSize / 1024)}K / ${r.activeLanes}L / ${r.activeChannels}c | +${r.bloatMs}ms / ${r.retransmittedBlocks}blk | ${writeStr} | ${r.hashMatch ? '✓' : '✗'} |`,
     );

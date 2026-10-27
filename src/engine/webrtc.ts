@@ -137,6 +137,10 @@ export interface TelemetryHUDState {
   opfsSyncReady: boolean;
   secureContext: boolean;
   degraded: boolean;
+  turboAvailable: boolean;
+  localBusAvailable: boolean;
+  turboEndpoints: string[];
+  peerLanTurboUrl: string | null;
 }
 
 interface SpeedSample {
@@ -173,6 +177,8 @@ interface PeerLink {
   blastBridgePool: ChannelPool | null;
   nativeWorkerChannels: boolean;
   peerCaps: PeerCaps;
+  localBusToken: string | null;
+  peerLanTurboUrl: string | null;
   seededByBench: boolean;
   extraLanes: Map<string, ExtraLane>;
   cascade: IceCascadeMonitor;
@@ -230,17 +236,31 @@ const TRANSPORT_MODE_STORAGE_KEY = 'warp:transport-mode-v1';
 function loadStoredTransportMode(): TransportMode {
   try {
     const raw = localStorage.getItem(TRANSPORT_MODE_STORAGE_KEY);
-    if (raw === 'auto' || raw === 'blast-nack' || raw === 'reliable-sctp') return raw;
+    if (raw === 'auto' || raw === 'lan-turbo' || raw === 'blast-nack' || raw === 'reliable-sctp') return raw;
   } catch {
     // Ignore storage access errors in restricted frames.
   }
   return 'auto';
 }
 
+interface TransferTransportMeta {
+  turboEndpoint: string | null;
+  turboInstanceId: string | null;
+  localBusToken: string | null;
+}
+
 export class WarpWebRTCEngine {
   private readonly deviceProfile = detectDeviceProfile();
   private selfHw: SystemHardwareProfile | null = null;
   private transportMode: TransportMode = loadStoredTransportMode();
+  private readonly selfLocalBusId = randomId(8);
+  private busProbeChannel: BroadcastChannel | null = null;
+  private readonly reachableTurboByInstance = new Map<string, string>();
+  private readonly localTurboInstanceIds = new Set<string>();
+  private selfTurboLanUrls: string[] = [];
+  private lastTurboSignature = '';
+  private readonly initialTurboProbePromise: Promise<void>;
+  private turboProbeTimer: ReturnType<typeof setInterval> | null = null;
   private readonly worker: Worker;
   private lz4Ready = false;
   private opfsReady = false;
@@ -252,6 +272,7 @@ export class WarpWebRTCEngine {
   private readonly links = new Map<string, PeerLink>();
   private readonly linkById = new Map<string, PeerLink>();
   private readonly transfers = new Map<string, TransferRecord>();
+  private readonly transferTransportMeta = new Map<string, TransferTransportMeta>();
   private readonly sourceFiles = new Map<string, File>();
   private readonly speedHistory = new Map<string, SpeedSample[]>();
   private readonly sendDrainedHashes = new Map<string, string>();
@@ -290,6 +311,32 @@ export class WarpWebRTCEngine {
       }
     });
 
+    if (typeof BroadcastChannel !== 'undefined') {
+      try {
+        const ch = new BroadcastChannel('warp-local-bus-probe-v1');
+        ch.onmessage = (ev: MessageEvent<{ targetBusId?: string; senderPeerId?: string; token?: string }>) => {
+          const d = ev.data;
+          if (!d || d.targetBusId !== this.selfLocalBusId || !d.senderPeerId || !d.token) return;
+          const link = this.links.get(d.senderPeerId);
+          if (link && !link.disposed) {
+            link.localBusToken = d.token;
+            this.sendControl(link, { t: 'local-bus-ack', token: d.token });
+            this.emitHud();
+          }
+        };
+        this.busProbeChannel = ch;
+      } catch {
+        this.busProbeChannel = null;
+      }
+    }
+
+    this.initialTurboProbePromise = this.probeLocalTurboServer();
+    this.turboProbeTimer = setInterval(() => {
+      if (this.benchSenders.size === 0 && this.benchRecvLinks.size === 0) {
+        void this.probeLocalTurboServer();
+      }
+    }, 5_000);
+
     this.telemetryTimer = setInterval(() => {
       void this.tickTelemetry();
     }, 450);
@@ -301,9 +348,117 @@ export class WarpWebRTCEngine {
       credit: true,
       bench: true,
       blastNack: true,
+      localBusId: this.selfLocalBusId,
+      turboEndpoints: this.selfTurboLanUrls.length > 0 ? this.selfTurboLanUrls : undefined,
+      turboInstances:
+        this.reachableTurboByInstance.size > 0 ? [...this.reachableTurboByInstance.keys()] : undefined,
       userAgentSummary: this.deviceProfile.summary,
       hw: this.selfHw ?? undefined,
     };
+  }
+
+  private async probeTurboOrigin(
+    origin: string,
+    timeoutMs = 650,
+  ): Promise<{ instanceId: string; endpoints: string[] } | null> {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${origin.replace(/\/+$/, '')}/warp-turbo/info`, {
+        method: 'GET',
+        signal: ctrl.signal,
+        cache: 'no-store',
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as {
+        ok?: boolean;
+        service?: string;
+        instanceId?: string;
+        endpoints?: string[];
+      };
+      if (!data?.ok || data.service !== 'airdrop-lan-warp-turbo' || typeof data.instanceId !== 'string') {
+        return null;
+      }
+      return {
+        instanceId: data.instanceId,
+        endpoints: Array.isArray(data.endpoints) ? data.endpoints : [],
+      };
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async probeLocalTurboServer(): Promise<void> {
+    const candidates: string[] = [];
+    if (typeof window !== 'undefined' && window.location.protocol === 'http:' && window.location.origin) {
+      candidates.push(window.location.origin);
+    }
+    if (!candidates.includes('http://127.0.0.1:8787')) {
+      candidates.push('http://127.0.0.1:8787');
+    }
+
+    const foundLocalIds = new Set<string>();
+    const lanUrls = new Set<string>();
+
+    for (const origin of candidates) {
+      const info = await this.probeTurboOrigin(origin, 550);
+      if (!info) continue;
+      foundLocalIds.add(info.instanceId);
+      this.reachableTurboByInstance.set(info.instanceId, origin);
+      for (const ep of info.endpoints) {
+        if (!ep.includes('127.0.0.1') && !ep.includes('localhost')) {
+          lanUrls.add(ep);
+        }
+      }
+    }
+
+    for (const oldId of [...this.localTurboInstanceIds]) {
+      if (!foundLocalIds.has(oldId)) {
+        this.localTurboInstanceIds.delete(oldId);
+        this.reachableTurboByInstance.delete(oldId);
+      }
+    }
+    for (const id of foundLocalIds) this.localTurboInstanceIds.add(id);
+    this.selfTurboLanUrls = [...lanUrls];
+
+    const sig = `${[...this.reachableTurboByInstance.entries()].map(([k, v]) => `${k}@${v}`).join(',')}|${this.selfTurboLanUrls.join(',')}`;
+    if (sig !== this.lastTurboSignature) {
+      this.lastTurboSignature = sig;
+      this.broadcastHello();
+      this.emitHud();
+    }
+  }
+
+  private async probePeerTurboEndpoints(link: PeerLink): Promise<void> {
+    const endpoints = link.peerCaps.turboEndpoints ?? [];
+    if (endpoints.length === 0 || link.disposed) return;
+
+    let changed = false;
+    for (const ep of endpoints) {
+      if (link.disposed) return;
+      const info = await this.probeTurboOrigin(ep, 700);
+      if (!info) continue;
+      if (!this.reachableTurboByInstance.has(info.instanceId)) {
+        this.reachableTurboByInstance.set(info.instanceId, ep);
+        changed = true;
+      }
+    }
+    if (changed && !link.disposed) {
+      this.broadcastHello();
+      this.emitHud();
+    }
+  }
+
+  private resolveSharedTurbo(link: PeerLink | null): { instanceId: string; localUrl: string } | null {
+    if (!link) return null;
+    const peerInstances = link.peerCaps.turboInstances ?? [];
+    for (const instId of peerInstances) {
+      const localUrl = this.reachableTurboByInstance.get(instId);
+      if (localUrl) return { instanceId: instId, localUrl };
+    }
+    return null;
   }
 
   private broadcastHello(): void {
@@ -547,6 +702,12 @@ export class WarpWebRTCEngine {
 
       const link = await this.ensureLink(peerId, peerName);
       const rtt = link.telemetry.rttMs ?? link.pingRttMs;
+      await this.initialTurboProbePromise;
+      if (link.peerCaps.turboEndpoints && link.peerCaps.turboEndpoints.length > 0) {
+        await this.probePeerTurboEndpoints(link);
+      }
+      const sharedTurbo = this.resolveSharedTurbo(link);
+      const localBusReady = Boolean(link.localBusToken);
       const plan = negotiateJointTransferPlan(
         this.deviceProfile,
         link.peerCaps.hw,
@@ -555,12 +716,20 @@ export class WarpWebRTCEngine {
         rtt,
         this.transportMode,
         Boolean(link.peerCaps.blastNack),
+        localBusReady,
+        sharedTurbo?.localUrl ?? null,
       );
       record.transport = plan.transport;
       record.chunkSize = plan.initialChunk;
       record.activeLanes = plan.initialLanes;
 
-      if (!link.seededByBench) {
+      this.transferTransportMeta.set(id, {
+        turboEndpoint: plan.transport === 'lan-turbo' ? (sharedTurbo?.localUrl ?? null) : null,
+        turboInstanceId: plan.transport === 'lan-turbo' ? (sharedTurbo?.instanceId ?? null) : null,
+        localBusToken: plan.transport === 'local-bus' ? link.localBusToken : null,
+      });
+
+      if (!link.seededByBench && plan.transport !== 'lan-turbo' && plan.transport !== 'local-bus') {
         this.postWorker({
           type: 'seed',
           linkId: link.linkId,
@@ -573,13 +742,14 @@ export class WarpWebRTCEngine {
         });
       }
 
-      // Pre-spin clean background SCTP lanes conservatively: max 1 extra lane on Wi-Fi double-hop,
-      // up to maxExtraLanes on Ethernet/hybrid links so Wi-Fi TX queues stay unbloated.
-      if (file.size >= 16 * 1024 * 1024 && link.telemetry.route !== 'relay') {
-        const bothWifi =
-          this.deviceProfile.networkMedium === 'wifi' && link.peerCaps.hw?.networkMedium === 'wifi';
-        const capExtra = bothWifi ? Math.min(1, link.peerCaps.lanes) : link.peerCaps.lanes;
-        const targetExtra = Math.min(this.deviceProfile.maxExtraLanes, capExtra);
+      // Pre-spin clean background SCTP lanes for large WebRTC transfers
+      if (
+        plan.transport !== 'lan-turbo' &&
+        plan.transport !== 'local-bus' &&
+        file.size >= 16 * 1024 * 1024 &&
+        link.telemetry.route !== 'relay'
+      ) {
+        const targetExtra = Math.min(this.deviceProfile.maxExtraLanes, link.peerCaps.lanes);
         if (targetExtra > 0) void this.ensureExtraLanes(link, targetExtra);
       }
 
@@ -598,6 +768,8 @@ export class WarpWebRTCEngine {
         compressed: record.compressed,
         entropy: record.entropy,
         transport: plan.transport,
+        turboInstanceId: plan.transport === 'lan-turbo' ? (sharedTurbo?.instanceId ?? null) : null,
+        localBusToken: plan.transport === 'local-bus' ? link.localBusToken : null,
       };
       this.sendControl(link, { t: 'offer', file: meta });
       return id;
@@ -646,6 +818,7 @@ export class WarpWebRTCEngine {
     this.speedHistory.set(transferId, [{ t: performance.now(), bytes: 0, wireBytes: 0 }]);
     this.emitTransfers();
 
+    const meta = this.transferTransportMeta.get(transferId);
     this.postWorker({
       type: 'recv-start',
       linkId: link.linkId,
@@ -655,6 +828,8 @@ export class WarpWebRTCEngine {
       size: record.fileSize,
       compress: record.compressed,
       transport: record.transport,
+      turboEndpoint: meta?.turboEndpoint ?? null,
+      localBusToken: meta?.localBusToken ?? null,
       saveHandle: saveChoice.kind === 'handle' ? saveChoice.handle : null,
       bench: false,
       preferredSink: 'auto',
@@ -776,6 +951,13 @@ export class WarpWebRTCEngine {
       await this.ensureExtraLanes(link, maxExtra);
     }
 
+    await this.initialTurboProbePromise;
+    if (link.peerCaps.turboEndpoints && link.peerCaps.turboEndpoints.length > 0) {
+      await this.probePeerTurboEndpoints(link);
+    }
+    const sharedTurbo = this.resolveSharedTurbo(link);
+    const localBusReady = Boolean(link.localBusToken);
+
     const totalPossibleLanes = 1 + link.extraLanes.size;
     const steps = buildPresetSteps(
       preset,
@@ -785,6 +967,8 @@ export class WarpWebRTCEngine {
       this.opfsSyncReady,
       link.nativeWorkerChannels,
       Boolean(link.peerCaps.blastNack),
+      Boolean(sharedTurbo),
+      localBusReady,
     );
 
     const results: BenchmarkRunResult[] = [];
@@ -817,6 +1001,8 @@ export class WarpWebRTCEngine {
       this.syncBridgeStats(link);
     }
 
+    const sharedTurbo = this.resolveSharedTurbo(link);
+    const localBusReady = Boolean(link.localBusToken);
     const defaultPlan = negotiateJointTransferPlan(
       this.deviceProfile,
       link.peerCaps.hw,
@@ -825,6 +1011,8 @@ export class WarpWebRTCEngine {
       link.telemetry.rttMs ?? link.pingRttMs,
       this.transportMode,
       Boolean(link.peerCaps.blastNack),
+      localBusReady,
+      sharedTurbo?.localUrl ?? null,
     );
     const stepTransport: ActiveTransportKind =
       step.transport ??
@@ -870,6 +1058,8 @@ export class WarpWebRTCEngine {
         preferredSink: step.preferredSink,
         windowOverride: step.windowOverride,
         transport: stepTransport,
+        turboInstanceId: stepTransport === 'lan-turbo' ? (sharedTurbo?.instanceId ?? null) : null,
+        localBusToken: stepTransport === 'local-bus' ? link.localBusToken : null,
       });
 
       const { window: creditWindow, sink: negotiatedSink } = await readyPromise;
@@ -900,6 +1090,9 @@ export class WarpWebRTCEngine {
         forceBridge: Boolean(step.forceBridge),
         compress: step.compress && this.lz4Ready,
         transport: stepTransport,
+        turboEndpoint: stepTransport === 'lan-turbo' ? (sharedTurbo?.localUrl ?? null) : null,
+        localBusToken: stepTransport === 'local-bus' ? link.localBusToken : null,
+        ignoreSeed: Boolean(step.transport || step.pinned || step.forceBridge),
         creditWindow,
         durationMs: step.durationMs,
         pinned: step.pinned ?? null,
@@ -932,11 +1125,24 @@ export class WarpWebRTCEngine {
         label: step.label,
         warmup: Boolean(step.warmup),
         timestamp: new Date().toISOString(),
-        route: statsAfter.primary.route,
-        candidatePairLabel: statsAfter.primary.candidatePairLabel,
-        localCandidateType: statsAfter.primary.localCandidateType,
-        remoteCandidateType: statsAfter.primary.remoteCandidateType,
-        protocol: statsAfter.primary.protocol,
+        route:
+          stepTransport === 'local-bus'
+            ? 'host'
+            : stepTransport === 'lan-turbo'
+              ? 'host'
+              : statsAfter.primary.route,
+        candidatePairLabel:
+          stepTransport === 'local-bus'
+            ? 'local-bus ⇄ shared-ram'
+            : stepTransport === 'lan-turbo'
+              ? `lan-turbo ⇄ ${sharedTurbo?.localUrl ?? 'tcp'}`
+              : statsAfter.primary.candidatePairLabel,
+        localCandidateType:
+          stepTransport === 'local-bus' ? 'ram' : stepTransport === 'lan-turbo' ? 'tcp' : statsAfter.primary.localCandidateType,
+        remoteCandidateType:
+          stepTransport === 'local-bus' ? 'ram' : stepTransport === 'lan-turbo' ? 'tcp' : statsAfter.primary.remoteCandidateType,
+        protocol:
+          stepTransport === 'local-bus' ? 'ipc' : stepTransport === 'lan-turbo' ? 'tcp' : statsAfter.primary.protocol,
         relayProtocol: statsAfter.primary.relayProtocol,
         rttMs: statsAfter.primary.rttMs ?? link.pingRttMs,
         minRttMs: finalTuner.minRttMs ?? null,
@@ -1012,6 +1218,15 @@ export class WarpWebRTCEngine {
 
   dispose(): void {
     if (this.telemetryTimer) clearInterval(this.telemetryTimer);
+    if (this.turboProbeTimer) clearInterval(this.turboProbeTimer);
+    if (this.busProbeChannel) {
+      try {
+        this.busProbeChannel.close();
+      } catch {
+        // Ignore.
+      }
+      this.busProbeChannel = null;
+    }
     this.cancelBenchmarks();
     for (const link of [...this.links.values()]) this.teardownLink(link, null);
     this.worker.terminate();
@@ -1068,6 +1283,8 @@ export class WarpWebRTCEngine {
       blastBridgePool: null,
       nativeWorkerChannels: false,
       peerCaps: { lanes: 0, credit: false, bench: false },
+      localBusToken: null,
+      peerLanTurboUrl: null,
       seededByBench: false,
       extraLanes: new Map(),
       cascade: new IceCascadeMonitor(pc, startNegotiation || this.isInitiatorFor(peerId), {
@@ -1732,8 +1949,25 @@ export class WarpWebRTCEngine {
     switch (msg.t) {
       case 'hello':
         link.peerName = msg.name || link.peerName;
-        if (msg.caps) link.peerCaps = msg.caps;
+        if (msg.caps) {
+          link.peerCaps = msg.caps;
+          link.peerLanTurboUrl =
+            msg.caps.turboEndpoints?.find((u) => !u.includes('127.0.0.1') && !u.includes('localhost')) ?? null;
+          if (msg.caps.localBusId && this.busProbeChannel) {
+            const token = link.localBusToken ?? [this.selfId, link.peerId].sort().join(':');
+            this.busProbeChannel.postMessage({
+              targetBusId: msg.caps.localBusId,
+              senderPeerId: this.selfId,
+              token,
+            });
+          }
+          void this.probePeerTurboEndpoints(link);
+        }
         this.callbacks.onRemoteHello?.(link.peerId, link.peerName, msg.deviceKind);
+        this.emitHud();
+        break;
+      case 'local-bus-ack':
+        link.localBusToken = msg.token;
         this.emitHud();
         break;
       case 'ping':
@@ -1779,6 +2013,18 @@ export class WarpWebRTCEngine {
       case 'offer': {
         this.focusedPeerId = link.peerId;
         const { file } = msg;
+        let resolvedTransport: ActiveTransportKind = file.transport ?? 'reliable-sctp';
+        let turboRxUrl: string | null = null;
+        if (resolvedTransport === 'lan-turbo') {
+          turboRxUrl =
+            (file.turboInstanceId && this.reachableTurboByInstance.get(file.turboInstanceId)) || null;
+          if (!turboRxUrl) resolvedTransport = 'blast-nack';
+        }
+        this.transferTransportMeta.set(file.id, {
+          turboEndpoint: turboRxUrl,
+          turboInstanceId: file.turboInstanceId ?? null,
+          localBusToken: resolvedTransport === 'local-bus' ? (file.localBusToken ?? null) : null,
+        });
         const rec: TransferRecord = {
           id: file.id,
           peerId: link.peerId,
@@ -1789,7 +2035,7 @@ export class WarpWebRTCEngine {
           mime: file.mime,
           entropy: file.entropy,
           compressed: file.compressed,
-          transport: file.transport ?? 'reliable-sctp',
+          transport: resolvedTransport,
           retransmittedBlocks: 0,
           status: 'offered',
           bytesTransferred: 0,
@@ -1831,6 +2077,11 @@ export class WarpWebRTCEngine {
         if (link.bridgePool) this.syncBridgeStats(link);
         rec.sink = msg.sink ?? null;
         if (msg.transport) rec.transport = msg.transport;
+        const meta = this.transferTransportMeta.get(rec.id);
+        const effectiveTurboEndpoint =
+          rec.transport === 'lan-turbo' ? (meta?.turboEndpoint ?? null) : null;
+        const effectiveLocalBusToken =
+          rec.transport === 'local-bus' ? (meta?.localBusToken ?? msg.localBusToken ?? null) : null;
         rec.status = 'transferring';
         rec.startedAt = Date.now();
         this.speedHistory.set(rec.id, [{ t: performance.now(), bytes: 0, wireBytes: 0 }]);
@@ -1841,6 +2092,8 @@ export class WarpWebRTCEngine {
           file,
           compress: rec.compressed,
           transport: rec.transport,
+          turboEndpoint: effectiveTurboEndpoint,
+          localBusToken: effectiveLocalBusToken,
           creditWindow: msg.window && msg.window > 0 ? msg.window : Number.POSITIVE_INFINITY,
           ramPreloadBudget: this.deviceProfile.senderRamPreloadBudget,
         });
@@ -1937,6 +2190,13 @@ export class WarpWebRTCEngine {
       }
       case 'bench-offer': {
         this.benchRecvLinks.set(msg.id, link);
+        let resolvedTransport: ActiveTransportKind = msg.transport ?? 'reliable-sctp';
+        let turboRxUrl: string | null = null;
+        if (resolvedTransport === 'lan-turbo') {
+          turboRxUrl =
+            (msg.turboInstanceId && this.reachableTurboByInstance.get(msg.turboInstanceId)) || null;
+          if (!turboRxUrl) resolvedTransport = 'reliable-sctp';
+        }
         this.postWorker({
           type: 'recv-start',
           linkId: link.linkId,
@@ -1944,7 +2204,9 @@ export class WarpWebRTCEngine {
           name: `benchmark-${msg.id}.bin`,
           size: msg.sizeBytes ?? Number.POSITIVE_INFINITY,
           compress: msg.compress,
-          transport: msg.transport ?? 'reliable-sctp',
+          transport: resolvedTransport,
+          turboEndpoint: turboRxUrl,
+          localBusToken: resolvedTransport === 'local-bus' ? (msg.localBusToken ?? null) : null,
           saveHandle: null,
           bench: true,
           preferredSink: msg.preferredSink ?? 'discard',
@@ -2218,12 +2480,15 @@ export class WarpWebRTCEngine {
         const link = this.links.get(rec.peerId);
         if (link && link.ctrl.readyState === 'open') {
           link.lastSink = msg.sink;
+          const meta = this.transferTransportMeta.get(msg.transferId);
           this.sendControl(link, {
             t: 'accept',
             id: msg.transferId,
             window: msg.window,
             sink: msg.sink,
             transport: rec.transport,
+            turboInstanceId: meta?.turboInstanceId ?? null,
+            localBusToken: meta?.localBusToken ?? null,
           });
         }
         this.emitTransfers();
@@ -2527,6 +2792,8 @@ export class WarpWebRTCEngine {
     const tuner = link?.lastTuner ?? null;
     const highWm = link?.highWatermark ?? INITIAL_HIGH_WATERMARK;
 
+    const sharedTurbo = this.resolveSharedTurbo(link);
+    const localBusReady = Boolean(link?.localBusToken);
     const previewPlan = link
       ? negotiateJointTransferPlan(
           this.deviceProfile,
@@ -2536,6 +2803,8 @@ export class WarpWebRTCEngine {
           rttMs,
           this.transportMode,
           Boolean(link.peerCaps.blastNack),
+          localBusReady,
+          sharedTurbo?.localUrl ?? null,
         )
       : null;
 
@@ -2585,6 +2854,12 @@ export class WarpWebRTCEngine {
       opfsSyncReady: this.opfsSyncReady,
       secureContext: this.secureContext,
       degraded: link?.telemetry.route === 'relay',
+      turboAvailable: Boolean(sharedTurbo) || this.reachableTurboByInstance.size > 0,
+      localBusAvailable: localBusReady,
+      turboEndpoints: this.selfTurboLanUrls,
+      peerLanTurboUrl:
+        link?.peerCaps.turboEndpoints?.find((u) => !u.includes('127.0.0.1') && !u.includes('localhost')) ??
+        null,
     };
     this.callbacks.onTelemetryChange(hud);
   }

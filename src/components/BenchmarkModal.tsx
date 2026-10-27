@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import {
   formatSuiteMarkdownReport,
+  formatTransportShort,
   type BenchmarkPresetId,
   type BenchmarkRunResult,
   type BenchmarkSuiteSummary,
@@ -412,7 +413,7 @@ export const BenchmarkModal: React.FC<BenchmarkModalProps> = ({
                       <div className="text-[10px] uppercase tracking-wider text-ink-tertiary">Winning Transport</div>
                       <div className="tabular-nums mt-0.5 font-mono text-xs font-semibold text-white">
                         {summary.bestRun
-                          ? `${summary.bestRun.transport === 'blast-nack' ? 'Blast+NACK' : 'Rel-SCTP'} · ${Math.round(summary.bestRun.chunkSize / 1024)}K · ${summary.bestRun.activeLanes}L`
+                          ? `${formatTransportShort(summary.bestRun.transport)} · ${Math.round(summary.bestRun.chunkSize / 1024)}K · ${summary.bestRun.activeLanes}L`
                           : '—'}
                       </div>
                       <div className="font-mono text-[10px] text-ink-tertiary">
@@ -436,6 +437,19 @@ export const BenchmarkModal: React.FC<BenchmarkModalProps> = ({
                       </div>
                     </div>
                   </div>
+
+                  {summary.udpRateLimited && (
+                    <div className="calm-row rounded-2xl border border-amber-system/40 bg-amber-system/12 p-3 text-xs">
+                      <div className="flex items-center gap-2 font-semibold text-amber-system">
+                        <span>⚠️ WebRTC UDP Rate-Cap Detected (&lt; 6 MB/s)</span>
+                      </div>
+                      <p className="mt-1 leading-relaxed text-ink-secondary">
+                        Windows Chromium enforces per-datagram socket throttling through{' '}
+                        <code className="text-white">NetworkService</code> when Defender Network Inspection or WFP callout drivers are active. Run{' '}
+                        <code className="rounded bg-black/50 px-1 py-0.5 text-cyan-ice">npm run turbo</code> on either machine to switch to Unencrypted Zero-Copy LAN Turbo TCP (150+ MB/s line rate).
+                      </p>
+                    </div>
+                  )}
 
                   <div className="flex flex-wrap items-center justify-end gap-2">
                     <button
@@ -486,12 +500,16 @@ export const BenchmarkModal: React.FC<BenchmarkModalProps> = ({
                           <td className="px-3 py-2">
                             <span
                               className={`rounded border px-1.5 py-0.5 text-[10px] ${
-                                r.transport === 'blast-nack'
-                                  ? 'border-lime-signal/35 text-lime-signal'
-                                  : 'border-cyan-ice/35 text-cyan-ice'
+                                r.transport === 'lan-turbo'
+                                  ? 'border-lime-signal/60 bg-lime-signal/20 text-lime-signal font-semibold'
+                                  : r.transport === 'local-bus'
+                                    ? 'border-purple-400/50 bg-purple-500/15 text-purple-300 font-semibold'
+                                    : r.transport === 'blast-nack'
+                                      ? 'border-lime-signal/35 text-lime-signal'
+                                      : 'border-cyan-ice/35 text-cyan-ice'
                               }`}
                             >
-                              {r.transport === 'blast-nack' ? 'Blast+NACK' : 'Rel-SCTP'}
+                              {formatTransportShort(r.transport)}
                             </span>
                           </td>
                           <td className="tabular-nums px-3 py-2 text-right">

@@ -20,12 +20,12 @@ export const LANE_CHANNELS = 2;
 export const FRAME_HEADER_BYTES = 8;
 
 /** Absolute bounds for the adaptive aggregate send-queue high watermark. */
-export const MIN_HIGH_WATERMARK = 512 * 1024;
+export const MIN_HIGH_WATERMARK = 1024 * 1024;
 export const MAX_HIGH_WATERMARK = 32 * 1024 * 1024;
-/** Conservative initial watermark (2 MiB) so Wi-Fi queues never bufferbloat before BDP is measured. */
-export const INITIAL_HIGH_WATERMARK = 2 * 1024 * 1024;
+/** Initial watermark (4 MiB) keeps multi-channel pipes full before BDP settles. */
+export const INITIAL_HIGH_WATERMARK = 4 * 1024 * 1024;
 export const HIGH_WATERMARK = INITIAL_HIGH_WATERMARK;
-export const LOW_WATERMARK = 256 * 1024;
+export const LOW_WATERMARK = 512 * 1024;
 
 export const ENTROPY_SAMPLE_BYTES = 64 * 1024;
 export const ENTROPY_THRESHOLD = 7.2;
@@ -45,8 +45,8 @@ export type Bottleneck = 'network' | 'bufferbloat' | 'receiver' | 'disk' | 'cpu'
 export type TunerPhase = 'warmup' | 'probing' | 'settled' | 'pinned';
 export type SchedulePolicy = 'least-buffered' | 'round-robin';
 export type WorkerChannelMode = 'native-worker-dc' | 'transferable-bridge';
-export type TransportMode = 'auto' | 'blast-nack' | 'reliable-sctp';
-export type ActiveTransportKind = 'blast-nack' | 'reliable-sctp';
+export type TransportMode = 'auto' | 'lan-turbo' | 'blast-nack' | 'reliable-sctp';
+export type ActiveTransportKind = 'lan-turbo' | 'local-bus' | 'blast-nack' | 'reliable-sctp';
 export type NetworkMedium = 'ethernet' | 'wifi' | 'cellular' | 'unknown';
 
 export interface SystemHardwareProfile {
@@ -101,6 +101,12 @@ export interface PeerCaps {
   bench: boolean;
   /** Supports `maxRetransmits: 0` Blast UDP channels + 16 KiB Bitmap NACK repair. */
   blastNack?: boolean;
+  /** Ephemeral BroadcastChannel probe ID to detect same-browser zero-copy memory bus. */
+  localBusId?: string;
+  /** Reachable unencrypted HTTP Cut-Through Pipe URLs (`http://<LAN-IP>:8787`) advertised by this peer. */
+  turboEndpoints?: string[];
+  /** Verified LAN Turbo daemon `instanceId`s this peer can currently reach. */
+  turboInstances?: string[];
   userAgentSummary?: string;
   hw?: SystemHardwareProfile;
 }
@@ -116,12 +122,25 @@ export interface FileOfferMeta {
   compressed: boolean;
   entropy: number;
   transport?: ActiveTransportKind;
+  turboEndpoint?: string | null;
+  turboInstanceId?: string | null;
+  localBusToken?: string | null;
 }
 
 export type ControlMessage =
   | { t: 'hello'; name: string; deviceKind: 'desktop' | 'mobile' | 'extension'; caps?: PeerCaps }
+  | { t: 'local-bus-ack'; token: string }
   | { t: 'offer'; file: FileOfferMeta }
-  | { t: 'accept'; id: string; window?: number; sink?: SinkKind; transport?: ActiveTransportKind }
+  | {
+      t: 'accept';
+      id: string;
+      window?: number;
+      sink?: SinkKind;
+      transport?: ActiveTransportKind;
+      turboEndpoint?: string | null;
+      turboInstanceId?: string | null;
+      localBusToken?: string | null;
+    }
   | { t: 'decline'; id: string }
   | { t: 'pause'; id: string }
   | { t: 'resume'; id: string }
@@ -151,6 +170,9 @@ export type ControlMessage =
       windowOverride?: number;
       sizeBytes?: number;
       transport?: ActiveTransportKind;
+      turboEndpoint?: string | null;
+      turboInstanceId?: string | null;
+      localBusToken?: string | null;
     }
   | { t: 'bench-ready'; id: string; window: number; sink: SinkKind }
   | { t: 'bench-stop'; id: string; bytes: number; senderHash: string; blast?: boolean }
@@ -196,8 +218,14 @@ export type ToWorker =
       /** Benchmark only: force frames through the transferable ArrayBuffer UI bridge even if worker owns channels. */
       forceBridge?: boolean;
       compress: boolean;
-      /** Transport mode ('blast-nack' uses maxRetransmits:0 + selective 16 KiB bitmap repair). */
+      /** Transport mode ('lan-turbo' | 'local-bus' | 'blast-nack' | 'reliable-sctp'). */
       transport: ActiveTransportKind;
+      /** Unencrypted HTTP Cut-Through Pipe URL when `transport === 'lan-turbo'`. */
+      turboEndpoint?: string | null;
+      /** Same-browser BroadcastChannel token when `transport === 'local-bus'`. */
+      localBusToken?: string | null;
+      /** Do not inherit seeded link chunk/lane values (used for isolated A/B benchmarks). */
+      ignoreSeed?: boolean;
       /** Receiver-advertised credit window in raw bytes (Infinity when the peer has no credit support). */
       creditWindow: number;
       /** Sender RAM preload budget in bytes for caching small/medium files completely in RAM. */
@@ -243,6 +271,8 @@ export type ToWorker =
       size: number;
       compress: boolean;
       transport: ActiveTransportKind;
+      turboEndpoint?: string | null;
+      localBusToken?: string | null;
       saveHandle: FileSystemFileHandle | null;
       bench: boolean;
       preferredSink?: 'auto' | SinkKind;

@@ -93,6 +93,8 @@ export const EngineerHUD: React.FC<EngineerHUDProps> = ({
         : `${routeInfo.short} (${hud.candidatePairLabel})`;
 
   const isBlast = hud.activeTransport === 'blast-nack';
+  const isTurbo = hud.activeTransport === 'lan-turbo';
+  const isLocalBus = hud.activeTransport === 'local-bus';
   const isBloatGuarded = hud.tuner?.bottleneck === 'bufferbloat';
 
   return (
@@ -126,12 +128,22 @@ export const EngineerHUD: React.FC<EngineerHUDProps> = ({
             {!compact && (
               <span
                 className={`rounded-full border px-2 py-0.5 font-mono text-[10px] font-medium ${
-                  isBlast
-                    ? 'border-lime-signal/40 bg-lime-signal/12 text-lime-signal'
-                    : 'border-cyan-ice/35 bg-cyan-warp/15 text-cyan-ice'
+                  isTurbo
+                    ? 'border-lime-signal/60 bg-lime-signal/20 text-lime-signal shadow-[0_0_12px_rgba(48,209,88,0.25)]'
+                    : isLocalBus
+                      ? 'border-purple-400/50 bg-purple-500/15 text-purple-300'
+                      : isBlast
+                        ? 'border-lime-signal/40 bg-lime-signal/12 text-lime-signal'
+                        : 'border-cyan-ice/35 bg-cyan-warp/15 text-cyan-ice'
                 }`}
               >
-                {isBlast ? 'Blast+NACK' : 'Rel-SCTP'}
+                {isTurbo
+                  ? '⚡ LAN Turbo TCP'
+                  : isLocalBus
+                    ? '⚡ Memory Bus'
+                    : isBlast
+                      ? 'Blast+NACK'
+                      : 'Rel-SCTP'}
               </span>
             )}
 
@@ -230,7 +242,13 @@ export const EngineerHUD: React.FC<EngineerHUDProps> = ({
                     {Math.round(hud.chunkSize / 1024)} KB · {hud.activeLanes}L
                   </div>
                   <div className="tabular-nums font-mono text-[10px] text-ink-tertiary">
-                    {isBlast ? 'UDP Blast + Bitmap NACK' : 'Reliable Unordered SCTP'}
+                    {isTurbo
+                      ? 'Unencrypted TCP Cut-Through Pipe'
+                      : isLocalBus
+                        ? 'Zero-Copy Browser Memory Bus'
+                        : isBlast
+                          ? 'UDP Blast + Bitmap NACK'
+                          : 'Reliable Unordered SCTP'}
                     {hud.tuner && hud.tuner.retransmittedBlocks > 0
                       ? ` (${hud.tuner.retransmittedBlocks} blk)`
                       : ''}
@@ -275,6 +293,7 @@ export const EngineerHUD: React.FC<EngineerHUDProps> = ({
                       {(
                         [
                           { id: 'auto', label: 'Auto' },
+                          { id: 'lan-turbo', label: 'LAN Turbo' },
                           { id: 'blast-nack', label: 'Blast+NACK' },
                           { id: 'reliable-sctp', label: 'Rel-SCTP' },
                         ] as const
@@ -300,7 +319,7 @@ export const EngineerHUD: React.FC<EngineerHUDProps> = ({
                   <div className="truncate">
                     <span className="text-ink-secondary">Local:</span>{' '}
                     {hud.selfHw
-                      ? `${hud.selfHw.summary} · RAM Arena ${formatBytes(hud.selfHw.ramArenaBudget, 0)}`
+                       ? `${hud.selfHw.summary} · RAM Arena ${formatBytes(hud.selfHw.ramArenaBudget, 0)}`
                       : 'Scanning hardware…'}
                   </div>
                   <div className="truncate">
@@ -313,6 +332,49 @@ export const EngineerHUD: React.FC<EngineerHUDProps> = ({
                   </div>
                 </div>
               </div>
+
+              {/* Unencrypted LAN Turbo Status & 1-Click Peer Switch */}
+              {hud.turboAvailable ? (
+                <div className="calm-row mt-2.5 flex items-center justify-between gap-2 rounded-xl border border-lime-signal/30 bg-lime-signal/[0.08] p-2.5">
+                  <div className="flex items-center gap-2">
+                    <span className="h-2 w-2 rounded-full bg-lime-signal shadow-[0_0_8px_#30d158]" />
+                    <div>
+                      <div className="font-mono text-[11px] font-semibold text-lime-signal">
+                        LAN Turbo Pipe Online · Unencrypted TCP Line Rate (150+ MB/s)
+                      </div>
+                      <div className="font-mono text-[10px] text-ink-tertiary">
+                        Zero-copy kernel cut-through stream active. WebRTC UDP encryption overhead eliminated.
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : hud.peerLanTurboUrl ? (
+                <div className="calm-row mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-cyan-ice/40 bg-cyan-warp/15 p-2.5">
+                  <div>
+                    <div className="font-mono text-[11px] font-semibold text-cyan-ice">
+                      Peer is running LAN Turbo Host ({hud.peerLanTurboUrl})
+                    </div>
+                    <div className="font-mono text-[10px] text-ink-tertiary">
+                      Switch to peer local HTTP address to unlock 150+ MB/s unencrypted zero-copy transfers.
+                    </div>
+                  </div>
+                  <a
+                    href={`${hud.peerLanTurboUrl}${typeof window !== 'undefined' ? window.location.hash : ''}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="warp-btn rounded-full border border-cyan-ice/60 bg-cyan-ice/20 px-3 py-1 font-mono text-[11px] font-semibold text-cyan-ice hover:bg-cyan-ice hover:text-black"
+                  >
+                    Open LAN Turbo URL ↗
+                  </a>
+                </div>
+              ) : (
+                <div className="calm-row mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-xl p-2.5 text-[11px]">
+                  <div className="min-w-0 flex-1 font-mono text-[10px] text-ink-tertiary">
+                    <span className="font-semibold text-ink-secondary">Speed Tip:</span> Run{' '}
+                    <code className="rounded bg-white/10 px-1 py-0.5 text-cyan-ice">npm run turbo</code> on any LAN laptop to bypass browser WebRTC UDP rate caps and achieve 150+ MB/s.
+                  </div>
+                </div>
+              )}
 
               {/* Dynamic BBR Autotuner + Speed Test Action */}
               <div className="calm-row mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-xl p-2.5">
