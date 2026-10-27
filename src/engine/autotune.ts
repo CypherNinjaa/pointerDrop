@@ -1,21 +1,20 @@
 /**
- * Warp Autotune — device-aware, measurement-driven transport tuning.
+ * Warp Autotune v2 — BBR-inspired delay-aware congestion & topology brain +
+ * bidirectional Sender ↔ Receiver hardware capability scanner.
  *
- * Nothing here assumes a fixed "best" chunk size or lane count. The tuner:
- *   1. Seeds an initial configuration from the device profile (CPU cores, RAM, mobile/desktop).
- *   2. Every epoch (≥ 550 ms and ≥ 8 RTTs) measures how many bytes actually left the
- *      send queues into SCTP (`drainBps`) and where the sender spent its time
- *      (waiting on the network queue, on receiver persistence credits, or on disk reads).
- *   3. Sizes the send-queue high watermark from the measured bandwidth-delay product.
- *   4. Hill-climbs chunk size (16 → 256 KB ladder, bounded strictly by SCTP maxMessageSize)
- *      and the number of active parallel SCTP lanes:
- *        • When the network queue is the bottleneck, both chunk size and lane count are probed.
- *        • When sender framing CPU is the bottleneck, chunk size is still probed (larger chunks
- *          cut per-frame JS/IPC/SCTP framing cost directly).
- *        • When receiver disk/credits or sender disk is the bottleneck, network hill-climbing
- *          pauses and reports the true bottleneck transparently.
- *   5. Settles when no neighbour improves throughput by ≥ 5 %, and re-probes when the
- *      measured rate drifts by > 30 % or every 15 s.
+ * Key upgrades over loss-only tuning:
+ *   1. Tracks true baseline `minRttMs` separately from loaded `rttMs`. Sizes the
+ *      send-queue watermark from `bps × cleanHorizon(minRttMs)` — NEVER from
+ *      bufferbloated RTT — breaking the 200+ ms Wi-Fi bufferbloat spiral.
+ *   2. Detects standing Wi-Fi TX queue bloat (`rttMs > max(32 ms, 3.2 × minRttMs)`):
+ *      automatically collapses extra competing SCTP lanes back to 1–2, trims chunk
+ *      size to 32–64 KiB (reducing SCTP fragment blast radius), and drains excess
+ *      queued megabytes so RTT stays crisp and packet loss stays near 0%.
+ *   3. On clean high-speed pipes (Ethernet ↔ Ethernet, Wi-Fi 6 ↔ Ethernet, clean 5 GHz),
+ *      scales watermarks up to 32 MiB, climbs chunk ladder up to 256 KiB, and opens
+ *      parallel SCTP associations when measured drain rate improves by ≥ 5%.
+ *   4. Scans both Sender and Receiver hardware (CPU cores, RAM GB, Ethernet vs Wi-Fi,
+ *      free storage, RAM Arena capacity) to compute an end-to-end joint transfer plan.
  */
 import {
   CHANNEL_COUNT,
@@ -23,9 +22,14 @@ import {
   INITIAL_HIGH_WATERMARK,
   MAX_HIGH_WATERMARK,
   MIN_HIGH_WATERMARK,
+  type ActiveTransportKind,
   type Bottleneck,
+  type IceRoute,
+  type NetworkMedium,
   type SchedulePolicy,
   type SinkKind,
+  type SystemHardwareProfile,
+  type TransportMode,
   type TuneConfig,
   type TunerPhase,
   type TunerSnapshot,
@@ -37,20 +41,45 @@ export interface DeviceProfile {
   cores: number;
   memoryGB: number | null;
   mobile: boolean;
+  networkMedium: NetworkMedium;
+  downlinkMbps: number | null;
   /** Extra RTCPeerConnections (beyond the primary) this device is willing to run. */
   maxExtraLanes: number;
   initialChunk: number;
   maxWatermark: number;
+  ramArenaBudget: number;
+  senderRamPreloadBudget: number;
   tier: 'low' | 'mid' | 'high';
+  platform: string;
   summary: string;
 }
+
+type NetworkInformationLike = {
+  type?: string;
+  effectiveType?: string;
+  downlink?: number;
+};
 
 type NavigatorLike = {
   hardwareConcurrency?: number;
   deviceMemory?: number;
   userAgent?: string;
+  connection?: NetworkInformationLike;
+  mozConnection?: NetworkInformationLike;
+  webkitConnection?: NetworkInformationLike;
+  storage?: { estimate?: () => Promise<{ quota?: number; usage?: number }> };
   userAgentData?: { mobile?: boolean; platform?: string; brands?: Array<{ brand: string; version: string }> };
 };
+
+export function detectNetworkMedium(nav?: NavigatorLike): { medium: NetworkMedium; downlinkMbps: number | null } {
+  const conn = nav?.connection ?? nav?.mozConnection ?? nav?.webkitConnection;
+  const rawType = (conn?.type ?? '').toLowerCase();
+  const downlink = typeof conn?.downlink === 'number' && conn.downlink > 0 ? conn.downlink : null;
+  if (rawType === 'ethernet') return { medium: 'ethernet', downlinkMbps: downlink };
+  if (rawType === 'wifi') return { medium: 'wifi', downlinkMbps: downlink };
+  if (rawType === 'cellular' || rawType === 'wimax') return { medium: 'cellular', downlinkMbps: downlink };
+  return { medium: 'unknown', downlinkMbps: downlink };
+}
 
 export function summarizeBrowserEnv(
   nav: NavigatorLike | undefined = typeof navigator !== 'undefined' ? (navigator as NavigatorLike) : undefined,
@@ -76,7 +105,10 @@ export function summarizeBrowserEnv(
     else os = 'OS';
   }
   const cores = nav?.hardwareConcurrency ? `${nav.hardwareConcurrency}c` : '';
-  return [browser, os, cores].filter(Boolean).join(' · ');
+  const ram = typeof nav?.deviceMemory === 'number' && nav.deviceMemory > 0 ? `${nav.deviceMemory}GB` : '';
+  const { medium } = detectNetworkMedium(nav);
+  const netLabel = medium !== 'unknown' ? medium : '';
+  return [browser, os, cores, ram, netLabel].filter(Boolean).join(' · ');
 }
 
 export function detectDeviceProfile(
@@ -84,53 +116,204 @@ export function detectDeviceProfile(
 ): DeviceProfile {
   const cores = Math.max(1, Math.min(64, nav?.hardwareConcurrency || 4));
   const memoryGB = typeof nav?.deviceMemory === 'number' && nav.deviceMemory > 0 ? nav.deviceMemory : null;
+  const ua = nav?.userAgent ?? '';
   const mobile =
     typeof nav?.userAgentData?.mobile === 'boolean'
       ? nav.userAgentData.mobile
-      : /Android|iPhone|iPad|iPod|Mobile/i.test(nav?.userAgent ?? '');
+      : /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
 
+  let platform = nav?.userAgentData?.platform || '';
+  if (!platform) {
+    if (/Android/i.test(ua)) platform = 'Android';
+    else if (/iPhone|iPad|iPod/i.test(ua)) platform = 'iOS';
+    else if (/Windows/i.test(ua)) platform = 'Windows';
+    else if (/Mac OS X/i.test(ua)) platform = 'macOS';
+    else if (/Linux/i.test(ua)) platform = 'Linux';
+    else platform = 'Unknown';
+  }
+
+  const { medium: networkMedium, downlinkMbps } = detectNetworkMedium(nav);
   const lowMem = memoryGB !== null && memoryGB <= 2;
   const tier: DeviceProfile['tier'] =
     cores <= 4 || lowMem ? 'low' : cores >= 8 && (memoryGB === null || memoryGB >= 4) ? 'high' : 'mid';
 
-  // Each extra lane is an independent DTLS + SCTP stack: cheap on multi-core desktops, modest on phones.
   const maxExtraLanes = mobile ? (tier === 'low' ? 1 : 2) : tier === 'low' ? 1 : tier === 'mid' ? 2 : 3;
-  // Conservative initial chunk size (64 KB on low/mobile, 128 KB on mid/high desktop); autotuner climbs to 256 KB when supported and faster.
-  const initialChunk = mobile || tier === 'low' ? 64 * 1024 : 128 * 1024;
+  // Start cleanly at 64 KiB (low SCTP fragment count on Wi-Fi); climb to 128–256 KiB when clean.
+  const initialChunk = 64 * 1024;
   let maxWatermark = memoryGB === null ? 16 * MB : memoryGB >= 8 ? 32 * MB : memoryGB >= 4 ? 16 * MB : 8 * MB;
   if (mobile) maxWatermark = Math.min(maxWatermark, 16 * MB);
+
+  // Safe RAM-First Turbo Arena budgets (kept well inside V8 per-worker ArrayBuffer heap limits)
+  const ramArenaBudget = mobile
+    ? lowMem
+      ? 96 * MB
+      : 192 * MB
+    : memoryGB !== null && memoryGB >= 16
+      ? 1024 * MB
+      : memoryGB !== null && memoryGB >= 8
+        ? 640 * MB
+        : 384 * MB;
+
+  const senderRamPreloadBudget = mobile
+    ? 96 * MB
+    : tier === 'high'
+      ? 512 * MB
+      : tier === 'mid'
+        ? 256 * MB
+        : 128 * MB;
 
   return {
     cores,
     memoryGB,
     mobile,
+    networkMedium,
+    downlinkMbps,
     maxExtraLanes,
     initialChunk,
     maxWatermark,
+    ramArenaBudget,
+    senderRamPreloadBudget,
     tier,
+    platform,
     summary: summarizeBrowserEnv(nav),
   };
 }
 
-/** Raw bytes a receiver lets the sender have outstanding (not yet persisted to disk). */
+export async function scanSystemHardware(
+  opfsSync: boolean,
+  nav: NavigatorLike | undefined = typeof navigator !== 'undefined' ? (navigator as NavigatorLike) : undefined,
+): Promise<SystemHardwareProfile> {
+  const profile = detectDeviceProfile(nav);
+  let storageFreeBytes: number | null = null;
+  if (nav?.storage?.estimate) {
+    try {
+      const est = await nav.storage.estimate();
+      if (typeof est.quota === 'number' && typeof est.usage === 'number') {
+        storageFreeBytes = Math.max(0, est.quota - est.usage);
+      }
+    } catch {
+      storageFreeBytes = null;
+    }
+  }
+  const directFileHandle =
+    typeof window !== 'undefined' &&
+    typeof (window as Window & { showSaveFilePicker?: unknown }).showSaveFilePicker === 'function';
+
+  return {
+    cores: profile.cores,
+    memoryGB: profile.memoryGB,
+    mobile: profile.mobile,
+    platform: profile.platform,
+    networkMedium: profile.networkMedium,
+    downlinkMbps: profile.downlinkMbps,
+    ramArenaBudget: profile.ramArenaBudget,
+    storageFreeBytes,
+    opfsSync,
+    directFileHandle,
+    summary: profile.summary,
+  };
+}
+
+export interface JointTransferPlan {
+  transport: ActiveTransportKind;
+  initialChunk: number;
+  initialLanes: number;
+  initialWatermark: number;
+  useSenderRamPreload: boolean;
+  topologyLabel: string;
+}
+
+/**
+ * Combines scanned Sender + Receiver hardware profiles, ICE route, and RTT to
+ * synthesize the optimal starting transport plan before the first byte is sent.
+ */
+export function negotiateJointTransferPlan(
+  sender: DeviceProfile,
+  receiverHw: SystemHardwareProfile | undefined,
+  fileSize: number,
+  route: IceRoute,
+  rttMs: number | null,
+  preferredMode: TransportMode,
+  peerBlastReady: boolean,
+): JointTransferPlan {
+  const sMed = sender.networkMedium;
+  const rMed = receiverHw?.networkMedium ?? 'unknown';
+
+  let topologyLabel = 'P2P Link';
+  if (route === 'relay') {
+    topologyLabel = 'TURN Relayed Path';
+  } else if (sMed === 'ethernet' && rMed === 'ethernet') {
+    topologyLabel = 'Ethernet ↔ Ethernet (Full-Duplex Wire)';
+  } else if ((sMed === 'ethernet' && rMed === 'wifi') || (sMed === 'wifi' && rMed === 'ethernet')) {
+    topologyLabel = 'Wi-Fi ↔ Ethernet (Single-Air-Hop Hybrid)';
+  } else if (sMed === 'wifi' && rMed === 'wifi') {
+    topologyLabel = 'Wi-Fi ↔ Wi-Fi (Half-Duplex Double-Hop)';
+  } else if (route === 'host') {
+    topologyLabel = 'Direct LAN UDP (host ↔ host)';
+  } else if (route === 'srflx') {
+    topologyLabel = 'NAT Reflexive UDP (srflx)';
+  }
+
+  let transport: ActiveTransportKind = 'reliable-sctp';
+  if (preferredMode === 'blast-nack' && peerBlastReady) {
+    transport = 'blast-nack';
+  } else if (preferredMode === 'reliable-sctp' || !peerBlastReady) {
+    transport = 'reliable-sctp';
+  } else if (peerBlastReady && route !== 'relay') {
+    // Auto mode: Blast UDP + Selective Reliable Repair avoids dcSCTP rwnd head-of-line stalls on Wi-Fi & WAN!
+    transport = 'blast-nack';
+  }
+
+  const bothWiredOrUltraLowRtt =
+    (sMed === 'ethernet' && rMed === 'ethernet') || (route === 'host' && rttMs !== null && rttMs <= 2.5);
+  const wifiDoubleHop = sMed === 'wifi' && rMed === 'wifi';
+  const minCores = Math.min(sender.cores, receiverHw?.cores ?? 4);
+
+  const initialChunk =
+    transport === 'blast-nack'
+      ? bothWiredOrUltraLowRtt
+        ? 64 * 1024
+        : 32 * 1024
+      : bothWiredOrUltraLowRtt
+        ? 128 * 1024
+        : 64 * 1024;
+
+  // Start with 1 lane on Wi-Fi double-hop to avoid multi-PC TX queue bloat; 2 lanes on wired/hybrid high-core links.
+  const initialLanes =
+    route === 'relay' || wifiDoubleHop || minCores <= 4 ? 1 : bothWiredOrUltraLowRtt ? 2 : 1;
+
+  const initialWatermark = bothWiredOrUltraLowRtt ? 8 * MB : wifiDoubleHop ? 2 * MB : 4 * MB;
+  const useSenderRamPreload = fileSize > 0 && fileSize <= sender.senderRamPreloadBudget;
+
+  return {
+    transport,
+    initialChunk,
+    initialLanes,
+    initialWatermark,
+    useSenderRamPreload,
+    topologyLabel,
+  };
+}
+
+/** Raw bytes a receiver lets the sender have outstanding (not yet persisted). */
 export function receiverCreditWindow(sink: SinkKind, profile: DeviceProfile): number {
   switch (sink) {
-    case 'opfs-sync':
+    case 'ram-arena':
     case 'discard':
+      return profile.mobile ? 32 * MB : 96 * MB;
+    case 'opfs-sync':
+    case 'direct-handle':
       return profile.mobile ? 24 * MB : 64 * MB;
     case 'opfs-writable':
-      // Bounded window for async WritableStream so promises and copies cannot accumulate unboundedly.
-      return profile.mobile ? 8 * MB : 16 * MB;
+      return profile.mobile ? 12 * MB : 24 * MB;
     case 'memory':
       return profile.mobile ? 8 * MB : 16 * MB;
   }
 }
 
-/** Largest file we are willing to accumulate in JS heap when OPFS is unavailable (e.g. non-HTTPS LAN IP). */
+/** Largest file we are willing to accumulate in JS heap when OPFS & Direct Handle are unavailable. */
 export function memorySinkBudget(profile: DeviceProfile): number {
-  const gb = profile.memoryGB ?? (profile.mobile ? 3 : 4);
-  const raw = Math.floor(gb * 1024 * MB * 0.12);
-  return Math.max(192 * MB, Math.min(profile.mobile ? 384 * MB : 1024 * MB, raw));
+  return profile.ramArenaBudget;
 }
 
 export function largestChunkFor(maxMessageSize: number | null | undefined, headerBytes: number): number {
@@ -148,6 +331,7 @@ export interface EpochSample {
   diskWaitMs: number;
   lz4Ms: number;
   rttMs: number;
+  retransmittedBlocks?: number;
 }
 
 type Move = 'chunk+' | 'lanes+' | 'chunk-' | 'lanes-';
@@ -155,28 +339,35 @@ const MOVE_ORDER: Move[] = ['chunk+', 'lanes+', 'chunk-', 'lanes-'];
 const CPU_MOVE_ORDER: Move[] = ['chunk+', 'chunk-'];
 const ACCEPT_GAIN = 1.05;
 const MEASURE_EPOCHS = 2;
-const REPROBE_MS = 15_000;
+const REPROBE_MS = 12_000;
 
 export function classifyBottleneck(
-  s: Pick<EpochSample, 'ms' | 'queueWaitMs' | 'creditWaitMs' | 'diskWaitMs' | 'drainedBytes'>,
+  s: Pick<EpochSample, 'ms' | 'queueWaitMs' | 'creditWaitMs' | 'diskWaitMs' | 'drainedBytes' | 'rttMs'>,
+  minRttMs = 0,
 ): Bottleneck {
   if (s.ms <= 0) return 'idle';
   const qw = s.queueWaitMs / s.ms;
   const cw = s.creditWaitMs / s.ms;
   const dw = s.diskWaitMs / s.ms;
   if (cw >= 0.28) return 'receiver';
-  if (qw >= 0.25) return 'network';
   if (dw >= 0.28) return 'disk';
+  const baseRtt = minRttMs > 0 ? minRttMs : s.rttMs;
+  if (qw >= 0.2 && s.rttMs > Math.max(35, baseRtt * 3.2)) return 'bufferbloat';
+  if (qw >= 0.22) return 'network';
   if (s.drainedBytes <= 0) return 'idle';
   return 'cpu';
 }
 
 export class AdaptiveTuner {
   config: TuneConfig;
+  transport: ActiveTransportKind;
   phase: TunerPhase = 'warmup';
   bottleneck: Bottleneck = 'idle';
   drainBps = 0;
-  lastDecision = 'Seeded from device profile';
+  minRttMs = 0;
+  lastRttMs = 0;
+  retransmittedBlocks = 0;
+  lastDecision = 'Seeded from joint hardware profile';
   private chunkIdx: number;
   private maxChunkIdx: number;
   private availableLanes: number;
@@ -197,11 +388,16 @@ export class AdaptiveTuner {
     maxChunk: number,
     availableLanes: number,
     seed?: Partial<TuneConfig> | null,
+    transport: ActiveTransportKind = 'reliable-sctp',
   ) {
-    this.maxChunkIdx = Math.max(0, ladderIndexAtMost(maxChunk));
-    this.chunkIdx = Math.min(this.maxChunkIdx, ladderIndexAtMost(seed?.chunk ?? profile.initialChunk));
+    this.transport = seed?.transport ?? transport;
+    // In Blast-NACK mode, cap chunk size at 64 KiB so each datagram burst is ≤ 55 MTU fragments.
+    const effectiveMaxChunk = this.transport === 'blast-nack' ? Math.min(maxChunk, 64 * 1024) : maxChunk;
+    this.maxChunkIdx = Math.max(0, ladderIndexAtMost(effectiveMaxChunk));
+    const defaultInitChunk = this.transport === 'blast-nack' ? 32 * 1024 : profile.initialChunk;
+    this.chunkIdx = Math.min(this.maxChunkIdx, ladderIndexAtMost(seed?.chunk ?? defaultInitChunk));
     this.availableLanes = Math.max(1, availableLanes);
-    const initialLanes = seed?.lanes ?? (profile.mobile ? Math.min(2, this.availableLanes) : this.availableLanes);
+    const initialLanes = seed?.lanes ?? 1;
     this.config = {
       chunk: CHUNK_LADDER[this.chunkIdx],
       lanes: clamp(initialLanes, 1, this.availableLanes),
@@ -212,6 +408,7 @@ export class AdaptiveTuner {
       ),
       channels: clamp(seed?.channels ?? CHANNEL_COUNT, 1, CHANNEL_COUNT),
       schedule: (seed?.schedule ?? 'least-buffered') as SchedulePolicy,
+      transport: this.transport,
     };
     if (seed?.chunk || seed?.lanes) this.lastDecision = 'Seeded from measured link profile';
   }
@@ -224,9 +421,11 @@ export class AdaptiveTuner {
         pinned.lanes !== undefined ||
         pinned.highWatermark !== undefined ||
         pinned.channels !== undefined ||
-        pinned.schedule !== undefined);
+        pinned.schedule !== undefined ||
+        pinned.transport !== undefined);
     this.pinned = hasPin ? pinned : null;
     if (this.pinned) {
+      if (this.pinned.transport) this.transport = this.pinned.transport;
       if (this.pinned.chunk !== undefined) {
         this.chunkIdx = Math.min(this.maxChunkIdx, ladderIndexAtMost(this.pinned.chunk));
       }
@@ -240,15 +439,16 @@ export class AdaptiveTuner {
         ),
         channels: clamp(this.pinned.channels ?? this.config.channels ?? CHANNEL_COUNT, 1, CHANNEL_COUNT),
         schedule: this.pinned.schedule ?? this.config.schedule ?? 'least-buffered',
+        transport: this.transport,
       };
       this.phase = 'pinned';
-      this.lastDecision = `Pinned ${kb(this.config.chunk)} · ${this.config.channels ?? CHANNEL_COUNT}ch · ${this.config.lanes} lane(s)`;
+      this.lastDecision = `Pinned ${kb(this.config.chunk)} · ${this.config.channels ?? CHANNEL_COUNT}ch · ${this.config.lanes}L (${this.transport})`;
     }
   }
 
-  /** Called when SCTP maxMessageSize or the number of connected lanes changes. Returns true if config changed. */
   setLimits(maxChunk: number, availableLanes: number): boolean {
-    const nextMaxIdx = Math.max(0, ladderIndexAtMost(maxChunk));
+    const cappedMax = this.transport === 'blast-nack' ? Math.min(maxChunk, 64 * 1024) : maxChunk;
+    const nextMaxIdx = Math.max(0, ladderIndexAtMost(cappedMax));
     const lanes = Math.max(1, availableLanes);
     let changed = false;
     if (nextMaxIdx !== this.maxChunkIdx) {
@@ -264,18 +464,15 @@ export class AdaptiveTuner {
     }
     if (lanes !== this.availableLanes) {
       const grew = lanes > this.availableLanes;
-      const wasUsingAll = this.config.lanes === this.availableLanes;
       this.availableLanes = lanes;
-      const target = this.pinned?.lanes
-        ? clamp(this.pinned.lanes, 1, lanes)
-        : grew && wasUsingAll && !this.profile.mobile
-          ? lanes
-          : clamp(this.config.lanes, 1, lanes);
+      const target = this.pinned?.lanes ? clamp(this.pinned.lanes, 1, lanes) : clamp(this.config.lanes, 1, lanes);
       if (target !== this.config.lanes) {
         this.config = { ...this.config, lanes: target };
         changed = true;
       }
-      if (grew && this.phase === 'settled') this.startProbe('Parallel SCTP lane connected — re-probing');
+      if (grew && this.phase === 'settled' && this.bottleneck !== 'bufferbloat') {
+        this.startProbe('Parallel SCTP lane ready — probing multi-lane gain');
+      }
     }
     return changed;
   }
@@ -289,16 +486,25 @@ export class AdaptiveTuner {
   }
 
   snapshot(lz4: boolean): TunerSnapshot {
+    const bloatMs =
+      this.minRttMs > 0 && this.lastRttMs > this.minRttMs
+        ? Math.round((this.lastRttMs - this.minRttMs) * 10) / 10
+        : 0;
     return {
       ...this.config,
+      transport: this.transport,
       phase: this.phase,
       bottleneck: this.bottleneck,
       drainBps: Math.round(this.drainBps),
+      minRttMs: Math.round(this.minRttMs * 10) / 10,
+      rttMs: Math.round(this.lastRttMs * 10) / 10,
+      bloatMs,
       availableLanes: this.availableLanes,
       maxChunk: this.maxChunk,
       queueWaitPct: Math.round(this.last.qw * 100),
       creditWaitPct: Math.round(this.last.cw * 100),
       diskWaitPct: Math.round(this.last.dw * 100),
+      retransmittedBlocks: this.retransmittedBlocks,
       lz4,
       lastDecision: this.lastDecision,
     };
@@ -307,9 +513,19 @@ export class AdaptiveTuner {
   /** Feed one measurement epoch. Returns true when the configuration changed. */
   onEpoch(sample: EpochSample, now = Date.now()): boolean {
     if (sample.ms <= 0) return false;
+    if (sample.rttMs > 0) {
+      this.lastRttMs = sample.rttMs;
+      if (this.minRttMs === 0 || sample.rttMs < this.minRttMs) {
+        this.minRttMs = sample.rttMs;
+      }
+    }
+    if (sample.retransmittedBlocks !== undefined) {
+      this.retransmittedBlocks = sample.retransmittedBlocks;
+    }
+
     const bps = (sample.drainedBytes * 1000) / sample.ms;
     this.drainBps = this.drainBps === 0 ? bps : this.drainBps * 0.45 + bps * 0.55;
-    this.bottleneck = classifyBottleneck(sample);
+    this.bottleneck = classifyBottleneck(sample, this.minRttMs);
     this.last = {
       qw: Math.min(1, sample.queueWaitMs / sample.ms),
       cw: Math.min(1, sample.creditWaitMs / sample.ms),
@@ -318,7 +534,26 @@ export class AdaptiveTuner {
 
     if (this.phase === 'pinned') return false;
 
-    let changed = this.retuneWatermark(bps, sample.rttMs);
+    // BBR Bufferbloat Mitigation: if standing queue inflated RTT > 3.2× minRTT (and > 35 ms),
+    // immediately drain standing queue and shed competing SCTP lanes so Wi-Fi stops dropping!
+    if (this.bottleneck === 'bufferbloat') {
+      let bloatChanged = this.retuneWatermark(bps, true);
+      if (this.config.lanes > 1) {
+        this.config = { ...this.config, lanes: this.config.lanes - 1 };
+        bloatChanged = true;
+      }
+      if (this.chunkIdx > ladderIndexAtMost(32 * 1024)) {
+        this.chunkIdx--;
+        this.config = { ...this.config, chunk: CHUNK_LADDER[this.chunkIdx] };
+        bloatChanged = true;
+      }
+      this.trial = null;
+      this.window = [];
+      this.lastDecision = `Bufferbloat guard (${Math.round(this.lastRttMs)}ms vs ${Math.round(this.minRttMs)}ms base) → ${kb(this.config.chunk)} × ${this.config.lanes}L · ${formatWM(this.config.highWatermark)}`;
+      return bloatChanged;
+    }
+
+    let changed = this.retuneWatermark(bps, false);
 
     if (this.phase === 'warmup') {
       if (--this.warmupLeft <= 0) this.startProbe('Warm-up complete — probing chunk & lane ladder');
@@ -335,7 +570,6 @@ export class AdaptiveTuner {
       return changed;
     }
 
-    // phase === 'probing'
     if (this.trial && this.trial.settle > 0) {
       this.trial.settle--;
       return changed;
@@ -353,7 +587,7 @@ export class AdaptiveTuner {
 
     if (!this.trial) {
       this.baseline = measured;
-      changed = this.nextMove(activeMoves) || changed;
+      changed = this.nextMove(activeMoves, false, now) || changed;
       return changed;
     }
 
@@ -363,15 +597,14 @@ export class AdaptiveTuner {
       this.lastDecision = `${describe(move)} improved ${mbps(this.baseline)} → ${mbps(measured)}`;
       this.baseline = measured;
       this.acceptedThisPass = true;
-      // Keep climbing in the winning direction while gains >= 5% continue.
       if (this.applyMove(move)) return true;
-      return this.nextMove(activeMoves, true) || changed;
+      return this.nextMove(activeMoves, true, now) || changed;
     }
     this.lastDecision = `${describe(move)} (${mbps(measured)} vs ${mbps(this.baseline)}) — kept ${kb(prev.chunk)} × ${prev.lanes}L`;
     this.config = { ...prev, highWatermark: this.config.highWatermark };
     this.chunkIdx = ladderIndexAtMost(prev.chunk);
     this.moveIdx++;
-    this.nextMove(activeMoves);
+    this.nextMove(activeMoves, false, now);
     return true;
   }
 
@@ -385,10 +618,15 @@ export class AdaptiveTuner {
     this.lastDecision = reason;
   }
 
-  private nextMove(moves: Move[], afterAccept = false): boolean {
+  private nextMove(moves: Move[], afterAccept = false, now = Date.now()): boolean {
     if (afterAccept) this.moveIdx++;
     while (this.moveIdx < moves.length) {
       const move = moves[this.moveIdx];
+      // Do not waste epochs stepping backwards right after upward steps improved speed in this pass
+      if (this.acceptedThisPass && (move === 'chunk-' || move === 'lanes-')) {
+        this.moveIdx++;
+        continue;
+      }
       if (this.applyMove(move)) return true;
       this.moveIdx++;
     }
@@ -396,13 +634,15 @@ export class AdaptiveTuner {
       this.moveIdx = 0;
       this.acceptedThisPass = false;
       for (; this.moveIdx < moves.length; this.moveIdx++) {
-        if (this.applyMove(moves[this.moveIdx])) return true;
+        const move = moves[this.moveIdx];
+        if (move === 'chunk-' || move === 'lanes-') continue;
+        if (this.applyMove(move)) return true;
       }
     }
     this.phase = 'settled';
-    this.settledAt = Date.now();
+    this.settledAt = now;
     this.settledBps = this.baseline;
-    this.lastDecision = `Optimal ${kb(this.config.chunk)} × ${this.config.lanes} lane(s) · ${mbps(this.baseline)}`;
+    this.lastDecision = `Optimal ${kb(this.config.chunk)} × ${this.config.lanes}L (${this.transport}) · ${mbps(this.baseline)}`;
     return false;
   }
 
@@ -417,25 +657,34 @@ export class AdaptiveTuner {
     if (chunkIdx < 0 || chunkIdx > this.maxChunkIdx || lanes < 1 || lanes > this.availableLanes) return false;
     this.chunkIdx = chunkIdx;
     this.config = { ...this.config, chunk: CHUNK_LADDER[chunkIdx], lanes };
-    // A newly activated lane begins in SCTP slow-start; give it an extra epoch to ramp.
     this.trial = { move, prev, settle: move === 'lanes+' ? 2 : 1 };
     this.window = [];
-    this.lastDecision = `Probing ${describe(move)} → ${kb(this.config.chunk)} × ${lanes} lane(s)`;
+    this.lastDecision = `Probing ${describe(move)} → ${kb(this.config.chunk)} × ${lanes}L`;
     return true;
   }
 
-  /** High watermark ≈ measured bandwidth × max(250 ms + 50 ms·extraLanes, 6·RTT), within device limits. */
-  private retuneWatermark(bps: number, rttMs: number): boolean {
-    if (this.bottleneck !== 'network' && this.bottleneck !== 'cpu') return false;
-    const minHorizon = 0.25 + Math.max(0, this.config.lanes - 1) * 0.05;
-    const horizon = Math.max(minHorizon, (6 * Math.max(1, rttMs)) / 1000);
+  /**
+   * BBR-inspired watermark sizing:
+   *   • Sizes queue strictly from `minRttMs` (unbloated propagation RTT), NEVER from bloated `lastRttMs`!
+   *   • When `bloated === true`, targets 120 ms of actual drain rate (`512 KB .. 4 MB`) to flush the router queue.
+   *   • When clean, targets `max(220 ms + 50 ms·extraLanes, 6 × minRttMs)` up to 32 MiB so 100+ MB/s links stay full.
+   */
+  private retuneWatermark(bps: number, bloated: boolean): boolean {
+    if (!bloated && this.bottleneck !== 'network' && this.bottleneck !== 'cpu') return false;
+    const baseRtt = this.minRttMs > 0 ? this.minRttMs : Math.min(20, Math.max(1, this.lastRttMs || 4));
+    const horizon = bloated
+      ? 0.12
+      : Math.max(0.22 + Math.max(0, this.config.lanes - 1) * 0.06, Math.min(0.6, (6 * baseRtt) / 1000));
+    const rawBytes = Math.max(MIN_HIGH_WATERMARK, bps * horizon);
+    const quantStep = rawBytes < 2 * MB ? 512 * 1024 : MB;
     const target = clamp(
-      Math.ceil((bps * horizon) / MB) * MB,
+      Math.ceil(rawBytes / quantStep) * quantStep,
       MIN_HIGH_WATERMARK,
-      Math.min(MAX_HIGH_WATERMARK, this.profile.maxWatermark),
+      bloated ? Math.min(4 * MB, this.profile.maxWatermark) : Math.min(MAX_HIGH_WATERMARK, this.profile.maxWatermark),
     );
     const current = this.config.highWatermark;
-    if (Math.abs(target - current) / current < 0.2) return false;
+    if (!bloated && Math.abs(target - current) / Math.max(1, current) < 0.2) return false;
+    if (target === current) return false;
     this.config = { ...this.config, highWatermark: target };
     return true;
   }
@@ -454,6 +703,7 @@ function ladderIndexAtMost(bytes: number): number {
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / Math.max(1, xs.length);
 const kb = (b: number) => `${Math.round(b / 1024)} KB`;
+const formatWM = (b: number) => (b >= MB ? `${(b / MB).toFixed(b % MB === 0 ? 0 : 1)} MB WM` : `${Math.round(b / 1024)} KB WM`);
 const mbps = (bps: number) => `${(bps / MB).toFixed(1)} MB/s`;
 const describe = (m: Move) =>
   m === 'chunk+' ? 'Larger chunks' : m === 'chunk-' ? 'Smaller chunks' : m === 'lanes+' ? 'More lanes' : 'Fewer lanes';
@@ -462,8 +712,10 @@ const label = (b: Bottleneck) =>
     ? 'Receiver disk/CPU'
     : b === 'disk'
       ? 'Sender disk'
-      : b === 'cpu'
-        ? 'Sender CPU'
-        : b === 'network'
-          ? 'Network'
-          : 'Idle sender';
+      : b === 'bufferbloat'
+        ? 'Wi-Fi bufferbloat'
+        : b === 'cpu'
+          ? 'Sender CPU'
+          : b === 'network'
+            ? 'Network'
+            : 'Idle sender';

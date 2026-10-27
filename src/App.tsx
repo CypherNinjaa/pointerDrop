@@ -6,7 +6,13 @@ import { PairingSheet } from './components/PairingSheet';
 import { Radar } from './components/Radar';
 import { TransferQueue } from './components/TransferQueue';
 import { loadCustomTurnServers, saveCustomTurnServers } from './engine/iceCascade';
-import { CHANNEL_COUNT, DEFAULT_CHUNK, INITIAL_HIGH_WATERMARK, LOW_WATERMARK } from './engine/protocol';
+import {
+  CHANNEL_COUNT,
+  DEFAULT_CHUNK,
+  INITIAL_HIGH_WATERMARK,
+  LOW_WATERMARK,
+  type TransportMode,
+} from './engine/protocol';
 import {
   detectDeviceKind,
   detectExtensionSidePanel,
@@ -35,6 +41,12 @@ const INITIAL_HUD: TelemetryHUDState = {
   statsWireMBps: 0,
   compressionRatio: null,
   compressed: false,
+  transportMode: 'auto',
+  activeTransport: 'blast-nack',
+  selfHw: null,
+  peerHw: null,
+  topologyLabel: 'Standby Mesh',
+  concurrentTransfers: 0,
   chunkSize: DEFAULT_CHUNK,
   maxSctpMessageSize: null,
   activeChannels: CHANNEL_COUNT,
@@ -687,6 +699,40 @@ export const App: React.FC = () => {
                   </div>
 
                   <div className="calm-row space-y-2 rounded-2xl p-3">
+                    <div className="text-xs font-medium text-ink-primary">Packet Transport Engine</div>
+                    <p className="text-[11px] text-ink-tertiary">
+                      <strong>Blast UDP + Bitmap NACK</strong> blasts single-shot UDP chunks and selectively repairs any
+                      missing 16 KB blocks at the end of each pass, avoiding SCTP reassembly stalls on Wi-Fi.
+                    </p>
+                    <div
+                      role="group"
+                      aria-label="Packet transport engine"
+                      className="grid grid-cols-3 gap-1 rounded-xl border border-white/12 bg-black/50 p-1 text-[11px]"
+                    >
+                      {(
+                        [
+                          { id: 'auto', label: 'Auto Smart' },
+                          { id: 'blast-nack', label: 'Blast + NACK' },
+                          { id: 'reliable-sctp', label: 'Reliable SCTP' },
+                        ] as const
+                      ).map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => engineRef.current?.setTransportMode(opt.id)}
+                          className={`warp-btn rounded-lg py-1.5 font-medium ${
+                            hud.transportMode === opt.id
+                              ? 'bg-cyan-warp font-semibold text-white'
+                              : 'text-ink-secondary hover:text-white'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="calm-row space-y-2 rounded-2xl p-3">
                     <div className="text-xs font-medium text-ink-primary">
                       Custom Tier-3 TURN Server (Optional)
                     </div>
@@ -781,7 +827,12 @@ export const App: React.FC = () => {
 
       {/* Bottom Dynamic Island Engineer HUD */}
       <footer className="mx-auto w-full max-w-[1360px] px-4 pb-3.5 sm:px-6">
-        <EngineerHUD hud={hud} compact={compact} onOpenBenchmark={() => setShowBenchmark(true)} />
+        <EngineerHUD
+          hud={hud}
+          compact={compact}
+          onOpenBenchmark={() => setShowBenchmark(true)}
+          onChangeTransportMode={(mode: TransportMode) => engineRef.current?.setTransportMode(mode)}
+        />
       </footer>
 
       {/* Repeatable Diagnostics & Autotune Benchmark Modal */}

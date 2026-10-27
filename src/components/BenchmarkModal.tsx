@@ -41,21 +41,27 @@ const PRESETS: Array<{
 }> = [
   {
     id: 'quick-autotune',
-    title: 'Quick Link & Autotune',
+    title: 'Quick Link & BBR Autotune',
     badge: '~6s · P0',
-    desc: 'Warm-up + dynamic hill-climb across 16–256 KiB chunks & parallel SCTP lanes. Seeds optimal config.',
+    desc: 'Warm-up + BBR delay-aware autotune across 16–256 KiB chunks & clean watermark horizon. Seeds link.',
+  },
+  {
+    id: 'blast-vs-reliable',
+    title: 'Blast UDP+NACK vs SCTP',
+    badge: '~9s · NEW',
+    desc: 'A/B tests RBUDP maxRetransmits:0 + 16 KB Bitmap NACK Repair against Reliable Unordered SCTP.',
   },
   {
     id: 'repeat-3x',
-    title: '3× Repeatable Median',
+    title: '3× RAM Arena Median',
     badge: '~12s · P0',
-    desc: 'Warm-up + 3 incompressible runs with OPFS persistence, median MB/s, p95 spread & 128-bit hash check.',
+    desc: 'Warm-up + 3 incompressible runs into RAM Turbo Arena, median MB/s, p95 spread & 128-bit hash check.',
   },
   {
     id: 'chunk-sweep',
     title: 'Chunk Sweep (16–256 KiB)',
     badge: '~14s · P3',
-    desc: 'Compares every SCTP-supported frame size + measures control-channel ping latency under bulk load.',
+    desc: 'Compares every SCTP-supported frame size + measures control-channel ping bloat under bulk load.',
   },
   {
     id: 'channel-lane-sweep',
@@ -64,23 +70,18 @@ const PRESETS: Array<{
     desc: 'Tests 1, 2, 4 channels, least-buffered vs round-robin scheduling, and parallel RTCPeerConnection lanes.',
   },
   {
-    id: 'worker-vs-bridge',
-    title: 'Worker DC vs UI Bridge',
-    badge: '~8s · P2',
-    desc: 'Directly compares native worker-owned RTCDataChannels against transferable ArrayBuffer bridge handoffs.',
-  },
-  {
     id: 'sink-and-lz4',
-    title: 'OPFS Sinks & LZ4 Audit',
+    title: 'RAM Arena vs OPFS & LZ4',
     badge: '~13s · P1/P6',
-    desc: 'Compares Network Discard vs OPFS Sync vs Bounded Async OPFS (8 MiB credit cap) + Raw vs WASM LZ4.',
+    desc: 'Compares Discard vs RAM Turbo Arena vs Coalesced OPFS Sync/Writable + Raw vs WASM LZ4.',
   },
 ];
 
 const NETWORK_OPTIONS = [
   'Same Router Wi-Fi 5/6',
   'Same Router Wi-Fi 2.4 GHz',
-  'Ethernet LAN',
+  'Wi-Fi ↔ Ethernet Hybrid LAN',
+  'Ethernet ↔ Ethernet LAN',
   'Cross-Network / WAN',
   'Mobile Hotspot / 5G',
   'Same-Device Loopback',
@@ -100,7 +101,7 @@ export const BenchmarkModal: React.FC<BenchmarkModalProps> = ({
 }) => {
   const reduceMotion = useReducedMotion();
   const [targetPeerId, setTargetPeerId] = useState<string>('');
-  const [preset, setPreset] = useState<BenchmarkPresetId>('quick-autotune');
+  const [preset, setPreset] = useState<BenchmarkPresetId>('blast-vs-reliable');
   const [networkTag, setNetworkTag] = useState<string>(NETWORK_OPTIONS[0]);
   const [powerTag, setPowerTag] = useState<string>(POWER_OPTIONS[0]);
 
@@ -194,16 +195,16 @@ export const BenchmarkModal: React.FC<BenchmarkModalProps> = ({
             animate={reduceMotion ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
             exit={reduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.98, y: 6 }}
             transition={{ duration: 0.18, ease: [0.23, 1, 0.32, 1] }}
-            className="glass-surface flex max-h-[92vh] w-full max-w-[920px] flex-col overflow-hidden rounded-glass"
+            className="glass-surface flex max-h-[92vh] w-full max-w-[960px] flex-col overflow-hidden rounded-glass"
           >
             {/* Header */}
             <div className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3.5 sm:px-6">
               <div>
                 <h2 id="warp-bench-title" className="text-sm font-semibold tracking-tight text-white sm:text-base">
-                  Link Diagnostics & Autotune Benchmark
+                  Link Diagnostics, Blast-NACK & Hardware Autotune Lab
                 </h2>
                 <p className="text-[11px] text-ink-secondary">
-                  Measures true ICE route evidence, WebRTC getStats() wire bytes, SCTP queue wait, OPFS write speed & 128-bit integrity.
+                  Compares Blast UDP + 16 KB Bitmap NACK vs Reliable SCTP, RAM Arena vs OPFS, BBR bloat guard & 128-bit integrity.
                 </p>
               </div>
               <button
@@ -220,9 +221,9 @@ export const BenchmarkModal: React.FC<BenchmarkModalProps> = ({
             <div className="flex-1 space-y-4 overflow-y-auto p-4 sm:p-6">
               {!hud.secureContext && (
                 <div className="rounded-2xl border border-amber-system/40 bg-amber-system/12 px-3.5 py-2.5 text-xs text-amber-system">
-                  <strong>Insecure HTTP Origin Detected:</strong> Browsers disable zero-RAM OPFS disk streaming over plain{' '}
-                  <code>http://192.168.x.x</code>. Network benchmarks still work via DiscardSink, but for multi-GB file
-                  transfers use <code>npm run dev:https</code> or the HTTPS GitHub Pages URL.
+                  <strong>Insecure HTTP Origin Detected:</strong> Browsers disable OPFS disk streaming over plain{' '}
+                  <code>http://192.168.x.x</code>. RAM Arena & Discard benchmarks still work, and multi-GB files work over{' '}
+                  <code>npm run dev:https</code> or the HTTPS GitHub Pages URL.
                 </div>
               )}
 
@@ -341,15 +342,15 @@ export const BenchmarkModal: React.FC<BenchmarkModalProps> = ({
                       </div>
                       {hud.tuner && (
                         <div className="truncate font-mono text-[10px] text-ink-tertiary">
-                          Autotuner ({hud.tuner.phase}): {hud.tuner.lastDecision} · Bottleneck: {hud.tuner.bottleneck}
+                          Autotuner ({hud.tuner.transport} · {hud.tuner.phase}): {hud.tuner.lastDecision}
                         </div>
                       )}
                     </div>
                   ) : (
                     <div className="text-xs text-ink-secondary">
                       {summary
-                        ? 'Suite complete — optimal chunk size, lane count & BDP watermark have been applied to this peer link.'
-                        : 'Select a diagnostic preset above to measure real bottlenecks without touching user files.'}
+                        ? 'Suite complete — winning transport mode, chunk size, lane count & BDP watermark are now active.'
+                        : `Topology: ${hud.topologyLabel}. Run a preset to measure & lock optimal link settings.`}
                     </div>
                   )}
                 </div>
@@ -387,35 +388,36 @@ export const BenchmarkModal: React.FC<BenchmarkModalProps> = ({
                 <div className="space-y-3">
                   <div className={`grid gap-2.5 ${compact ? 'grid-cols-2' : 'sm:grid-cols-4'}`}>
                     <div className="calm-row rounded-2xl p-3">
-                      <div className="text-[10px] uppercase tracking-wider text-ink-tertiary">Median App Speed</div>
+                      <div className="text-[10px] uppercase tracking-wider text-ink-tertiary">Best / Median Speed</div>
                       <div className="tabular-nums mt-0.5 font-mono text-base font-semibold text-lime-signal">
-                        {summary.medianMBps.toFixed(1)} MB/s
+                        {(summary.bestRun?.appMBps ?? summary.medianMBps).toFixed(1)} MB/s
                       </div>
                       <div className="tabular-nums font-mono text-[10px] text-ink-tertiary">
-                        ±{summary.p95VariationPct}% variation
+                        Median {summary.medianMBps.toFixed(1)} MB/s (±{summary.p95VariationPct}%)
                       </div>
                     </div>
 
                     <div className="calm-row rounded-2xl p-3">
-                      <div className="text-[10px] uppercase tracking-wider text-ink-tertiary">ICE Route Evidence</div>
+                      <div className="text-[10px] uppercase tracking-wider text-ink-tertiary">ICE & Bloat Evidence</div>
                       <div className="mt-0.5 truncate font-mono text-xs font-semibold text-cyan-ice">
                         {summary.bestRun?.candidatePairLabel ?? hud.candidatePairLabel}
                       </div>
                       <div className="tabular-nums font-mono text-[10px] text-ink-tertiary">
-                        RTT {summary.bestRun?.rttMs ?? '—'} ms · Load {summary.bestRun?.ctrlPingLoadedMs ?? '—'} ms
+                        minRTT {summary.bestRun?.minRttMs?.toFixed(1) ?? '—'} ms · Bloat +
+                        {summary.bestRun?.bloatMs?.toFixed(0) ?? 0} ms
                       </div>
                     </div>
 
                     <div className="calm-row rounded-2xl p-3">
-                      <div className="text-[10px] uppercase tracking-wider text-ink-tertiary">Optimal Transport</div>
+                      <div className="text-[10px] uppercase tracking-wider text-ink-tertiary">Winning Transport</div>
                       <div className="tabular-nums mt-0.5 font-mono text-xs font-semibold text-white">
                         {summary.bestRun
-                          ? `${Math.round(summary.bestRun.chunkSize / 1024)} KiB · ${summary.bestRun.activeLanes}L · ${summary.bestRun.activeChannels}ch`
+                          ? `${summary.bestRun.transport === 'blast-nack' ? 'Blast+NACK' : 'Rel-SCTP'} · ${Math.round(summary.bestRun.chunkSize / 1024)}K · ${summary.bestRun.activeLanes}L`
                           : '—'}
                       </div>
                       <div className="font-mono text-[10px] text-ink-tertiary">
                         {summary.bestRun
-                          ? `${formatBytes(summary.bestRun.highWatermark, 0)} WM · ${summary.bestRun.bottleneck} limit`
+                          ? `${formatBytes(summary.bestRun.highWatermark, 0)} WM · ${summary.bestRun.bottleneck}`
                           : '—'}
                       </div>
                     </div>
@@ -457,14 +459,14 @@ export const BenchmarkModal: React.FC<BenchmarkModalProps> = ({
               {/* Detailed Per-Step Telemetry Table */}
               {visibleRuns.length > 0 && (
                 <div className="calm-row overflow-x-auto rounded-2xl">
-                  <table className="w-full min-w-[740px] border-collapse text-left font-mono text-[11px]">
+                  <table className="w-full min-w-[780px] border-collapse text-left font-mono text-[11px]">
                     <thead>
                       <tr className="border-b border-white/10 text-[10px] uppercase tracking-wider text-ink-tertiary">
                         <th className="px-3 py-2.5">Step</th>
-                        <th className="px-3 py-2.5">ICE Pair</th>
+                        <th className="px-3 py-2.5">Mode</th>
                         <th className="px-3 py-2.5 text-right">App / Wire / Stats</th>
-                        <th className="px-3 py-2.5">Chunk · Lanes · Mode</th>
-                        <th className="px-3 py-2.5">Wait (Q/Cred/Disk)</th>
+                        <th className="px-3 py-2.5">Chunk · Lanes</th>
+                        <th className="px-3 py-2.5">Bloat / NACK</th>
                         <th className="px-3 py-2.5">Sink & Write</th>
                         <th className="px-3 py-2.5 text-right">Ping Idle→Load</th>
                         <th className="px-3 py-2.5 text-center">Hash</th>
@@ -481,7 +483,17 @@ export const BenchmarkModal: React.FC<BenchmarkModalProps> = ({
                             )}
                             {r.label}
                           </td>
-                          <td className="px-3 py-2 text-cyan-ice">{r.candidatePairLabel}</td>
+                          <td className="px-3 py-2">
+                            <span
+                              className={`rounded border px-1.5 py-0.5 text-[10px] ${
+                                r.transport === 'blast-nack'
+                                  ? 'border-lime-signal/35 text-lime-signal'
+                                  : 'border-cyan-ice/35 text-cyan-ice'
+                              }`}
+                            >
+                              {r.transport === 'blast-nack' ? 'Blast+NACK' : 'Rel-SCTP'}
+                            </span>
+                          </td>
                           <td className="tabular-nums px-3 py-2 text-right">
                             <span className="font-semibold text-lime-signal">{r.appMBps.toFixed(1)}</span>
                             <span className="text-ink-tertiary">
@@ -490,13 +502,10 @@ export const BenchmarkModal: React.FC<BenchmarkModalProps> = ({
                             </span>
                           </td>
                           <td className="tabular-nums px-3 py-2 text-ink-secondary">
-                            {Math.round(r.chunkSize / 1024)}K · {r.activeLanes}L · {r.activeChannels}ch ·{' '}
-                            <span className="text-ink-tertiary">
-                              {r.workerMode === 'native-worker-dc' ? 'worker-dc' : 'bridge'}
-                            </span>
+                            {Math.round(r.chunkSize / 1024)}K · {r.activeLanes}L · {r.activeChannels}ch
                           </td>
                           <td className="tabular-nums px-3 py-2 text-ink-secondary">
-                            {r.queueWaitPct}% / {r.creditWaitPct}% / {r.diskWaitPct}%{' '}
+                            +{r.bloatMs.toFixed(0)}ms · {r.retransmittedBlocks}blk{' '}
                             <span className="text-ink-tertiary">({r.bottleneck})</span>
                           </td>
                           <td className="tabular-nums px-3 py-2 text-ink-secondary">

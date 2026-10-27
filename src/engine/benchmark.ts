@@ -2,6 +2,7 @@ import {
   CHUNK_LADDER,
   FRAME_HEADER_BYTES,
   formatBytes,
+  type ActiveTransportKind,
   type Bottleneck,
   type IceRoute,
   type SchedulePolicy,
@@ -12,6 +13,7 @@ import {
 
 export type BenchmarkPresetId =
   | 'quick-autotune'
+  | 'blast-vs-reliable'
   | 'repeat-3x'
   | 'chunk-sweep'
   | 'channel-lane-sweep'
@@ -30,6 +32,7 @@ export interface BenchmarkStepSpec {
   compressible: boolean;
   compress: boolean;
   preferredSink: 'auto' | SinkKind;
+  transport?: ActiveTransportKind;
   windowOverride?: number;
   forceBridge?: boolean;
   pinned?: Partial<TuneConfig> | null;
@@ -48,6 +51,8 @@ export interface BenchmarkRunResult {
   protocol: string | null;
   relayProtocol: string | null;
   rttMs: number | null;
+  minRttMs: number | null;
+  bloatMs: number;
   ctrlPingIdleMs: number | null;
   ctrlPingLoadedMs: number | null;
   availableOutgoingBitrateMbps: number | null;
@@ -61,7 +66,8 @@ export interface BenchmarkRunResult {
   wireMBps: number;
   statsWireMBps: number;
   compressionRatio: number;
-  // 3. Sender Queue, Striping, Worker Mode & Autotuner
+  // 3. Sender Queue, Transport, Striping, Worker Mode & Autotuner
+  transport: ActiveTransportKind;
   chunkSize: number;
   activeLanes: number;
   activeChannels: number;
@@ -73,6 +79,8 @@ export interface BenchmarkRunResult {
   queueWaitPct: number;
   creditWaitPct: number;
   diskWaitPct: number;
+  retransmittedBlocks: number;
+  duplicateBlocks: number;
   bottleneck: Bottleneck;
   tunerDecision: string;
   // 4. Receiver Sink & Credit Backpressure
@@ -109,6 +117,7 @@ export function buildPresetSteps(
   opfsAvailable: boolean,
   opfsSyncAvailable: boolean,
   nativeWorkerSupported = true,
+  blastSupported = true,
 ): BenchmarkStepSpec[] {
   const sctpCap = maxSctpMessageSize && maxSctpMessageSize > 0 ? maxSctpMessageSize : 256 * 1024 + 64;
   const validChunks = CHUNK_LADDER.filter((c) => c + FRAME_HEADER_BYTES <= sctpCap);
@@ -117,7 +126,7 @@ export function buildPresetSteps(
     case 'quick-autotune':
       return [
         {
-          label: 'Warm-up (SCTP slow-start)',
+          label: 'Warm-up (Link Prime)',
           warmup: true,
           durationMs: 1_200,
           compressible: false,
@@ -135,6 +144,42 @@ export function buildPresetSteps(
         },
       ];
 
+    case 'blast-vs-reliable': {
+      const steps: BenchmarkStepSpec[] = [
+        {
+          label: 'Warm-up (Link Prime)',
+          warmup: true,
+          durationMs: 1_100,
+          compressible: false,
+          compress: false,
+          preferredSink: 'discard',
+          transport: 'reliable-sctp',
+          pinned: null,
+        },
+      ];
+      if (blastSupported) {
+        steps.push({
+          label: 'Blast UDP + 16KB Bitmap NACK',
+          durationMs: 3_600,
+          compressible: false,
+          compress: false,
+          preferredSink: 'discard',
+          transport: 'blast-nack',
+          pinned: null,
+        });
+      }
+      steps.push({
+        label: 'Reliable Unordered SCTP',
+        durationMs: 3_600,
+        compressible: false,
+        compress: false,
+        preferredSink: 'discard',
+        transport: 'reliable-sctp',
+        pinned: null,
+      });
+      return steps;
+    }
+
     case 'repeat-3x':
       return [
         {
@@ -151,7 +196,7 @@ export function buildPresetSteps(
           durationMs: 3_500,
           compressible: false,
           compress: false,
-          preferredSink: (opfsAvailable ? 'auto' : 'discard') as 'auto' | SinkKind,
+          preferredSink: 'ram-arena' as SinkKind,
           pinned: null,
         })),
       ];
@@ -165,6 +210,7 @@ export function buildPresetSteps(
           compressible: false,
           compress: false,
           preferredSink: 'discard',
+          transport: 'reliable-sctp',
           pinned: { chunk: 64 * 1024, lanes: 1 },
         },
         ...validChunks.map((chunk) => ({
@@ -173,7 +219,8 @@ export function buildPresetSteps(
           compressible: false,
           compress: false,
           preferredSink: 'discard' as const,
-          pinned: { chunk, lanes: Math.min(2, maxLanes) },
+          transport: 'reliable-sctp' as const,
+          pinned: { chunk, lanes: 1 },
         })),
       ];
 
@@ -260,7 +307,11 @@ export function buildPresetSteps(
             compress: false,
             preferredSink: 'discard',
             forceBridge: false,
-            pinned: { chunk: Math.min(64 * 1024, validChunks[validChunks.length - 1] ?? 64 * 1024), lanes: 1, channels: 4 },
+            pinned: {
+              chunk: Math.min(64 * 1024, validChunks[validChunks.length - 1] ?? 64 * 1024),
+              lanes: 1,
+              channels: 4,
+            },
           },
         ];
       }
@@ -295,16 +346,23 @@ export function buildPresetSteps(
       const steps: BenchmarkStepSpec[] = [
         {
           label: 'Network Only (Discard Sink)',
-          durationMs: 2_800,
+          durationMs: 2_600,
           compressible: false,
           compress: false,
           preferredSink: 'discard',
         },
+        {
+          label: 'RAM Turbo Arena (Zero-I/O Slabs)',
+          durationMs: 2_600,
+          compressible: false,
+          compress: false,
+          preferredSink: 'ram-arena',
+        },
       ];
       if (opfsSyncAvailable) {
         steps.push({
-          label: 'OPFS SyncAccessHandle',
-          durationMs: 2_800,
+          label: 'OPFS SyncAccessHandle (2 MiB Coalesced)',
+          durationMs: 2_600,
           compressible: false,
           compress: false,
           preferredSink: 'opfs-sync',
@@ -312,25 +370,25 @@ export function buildPresetSteps(
       }
       if (opfsAvailable) {
         steps.push({
-          label: 'OPFS Async Writable (8 MiB Credit Cap)',
-          durationMs: 2_800,
+          label: 'OPFS Async Writable (2 MiB Coalesced)',
+          durationMs: 2_600,
           compressible: false,
           compress: false,
           preferredSink: 'opfs-writable',
-          windowOverride: 8 * 1024 * 1024,
+          windowOverride: 16 * 1024 * 1024,
         });
       }
       steps.push(
         {
           label: 'Structured Text · Raw (LZ4 Off)',
-          durationMs: 2_600,
+          durationMs: 2_500,
           compressible: true,
           compress: false,
           preferredSink: 'discard',
         },
         {
           label: 'Structured Text · WASM LZ4 On',
-          durationMs: 2_600,
+          durationMs: 2_500,
           compressible: true,
           compress: true,
           preferredSink: 'discard',
@@ -378,6 +436,7 @@ export function summarizeBenchmarkSuite(
         highWatermark: bestRun.highWatermark,
         channels: bestRun.activeChannels,
         schedule: bestRun.schedule,
+        transport: bestRun.transport,
       }
     : null;
 
@@ -402,20 +461,21 @@ export function formatSuiteMarkdownReport(summary: BenchmarkSuiteSummary): strin
   if (summary.bestRun) {
     const b = summary.bestRun;
     lines.push(
-      `- Best Config: **${Math.round(b.chunkSize / 1024)} KiB** chunk · **${b.activeLanes} SCTP lane(s)** · **${b.activeChannels} ch (${b.schedule})** · **${formatBytes(b.highWatermark, 0)} WM**`,
-      `- Route Evidence: \`${b.candidatePairLabel}\` (RTT ${b.rttMs ?? '—'} ms, Loaded Ping ${b.ctrlPingLoadedMs ?? '—'} ms)`,
+      `- Best Config: **${b.transport === 'blast-nack' ? 'Blast UDP + Bitmap NACK' : 'Reliable SCTP'}** · **${Math.round(b.chunkSize / 1024)} KiB** chunk · **${b.activeLanes} lane(s)** · **${b.activeChannels} ch (${b.schedule})** · **${formatBytes(b.highWatermark, 0)} WM**`,
+      `- Route Evidence: \`${b.candidatePairLabel}\` (minRTT ${b.minRttMs ?? '—'} ms, RTT ${b.rttMs ?? '—'} ms, Bloat +${b.bloatMs} ms, Loaded Ping ${b.ctrlPingLoadedMs ?? '—'} ms)`,
       `- Endpoints: \`${b.senderEnv}\` → \`${b.receiverEnv}\` (${b.networkTag}, ${b.powerTag})`,
     );
   }
   lines.push(
     '',
-    '| Step | Route Pair | App MB/s | Wire MB/s | Stats MB/s | Chunk / Lanes / Ch | Queue / Credit Wait | Sink (Write MB/s) | Ping Idle→Load | Hash |',
-    '| :--- | :--- | ---: | ---: | ---: | :--- | ---: | :--- | ---: | :---: |',
+    '| Step | Mode | Route Pair | App MB/s | Wire MB/s | Stats MB/s | Chunk / Lanes / Ch | Bloat / Repair | Sink (Write MB/s) | Hash |',
+    '| :--- | :--- | :--- | ---: | ---: | ---: | :--- | ---: | :--- | :---: |',
   );
   for (const r of summary.runs) {
     const writeStr = r.receiverWriteMBps !== null ? `${r.sink} (${r.receiverWriteMBps.toFixed(0)} MB/s)` : r.sink;
+    const modeLabel = r.transport === 'blast-nack' ? 'Blast+NACK' : 'Rel-SCTP';
     lines.push(
-      `| ${r.warmup ? `[Warm] ${r.label}` : r.label} | \`${r.candidatePairLabel}\` | **${r.appMBps.toFixed(1)}** | ${r.wireMBps.toFixed(1)} | ${r.statsWireMBps.toFixed(1)} | ${Math.round(r.chunkSize / 1024)}K / ${r.activeLanes}L / ${r.activeChannels}c | ${r.queueWaitPct}% / ${r.creditWaitPct}% | ${writeStr} | ${r.ctrlPingIdleMs ?? '—'}→${r.ctrlPingLoadedMs ?? '—'} ms | ${r.hashMatch ? '✓' : '✗'} |`,
+      `| ${r.warmup ? `[Warm] ${r.label}` : r.label} | ${modeLabel} | \`${r.candidatePairLabel}\` | **${r.appMBps.toFixed(1)}** | ${r.wireMBps.toFixed(1)} | ${r.statsWireMBps.toFixed(1)} | ${Math.round(r.chunkSize / 1024)}K / ${r.activeLanes}L / ${r.activeChannels}c | +${r.bloatMs}ms / ${r.retransmittedBlocks}blk | ${writeStr} | ${r.hashMatch ? '✓' : '✗'} |`,
     );
   }
   return lines.join('\n');

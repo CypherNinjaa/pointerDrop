@@ -1,5 +1,5 @@
 import React from 'react';
-import { formatBytes } from '../engine/protocol';
+import { formatBytes, type SinkKind } from '../engine/protocol';
 import type { TransferRecord } from '../engine/webrtc';
 import { GlassCard } from './GlassCard';
 
@@ -17,9 +17,9 @@ export interface TransferQueueProps {
 function describeStatus(tr: TransferRecord): string {
   switch (tr.status) {
     case 'analyzing':
-      return 'Sampling 64 KB Shannon entropy…';
+      return 'Sampling 64 KB Shannon entropy & system budget…';
     case 'connecting':
-      return 'Opening 4-channel WebRTC pipe…';
+      return 'Negotiating WebRTC blast + reliable channels…';
     case 'offering':
       return `Waiting for ${tr.peerName} to accept`;
     case 'offered':
@@ -27,14 +27,16 @@ function describeStatus(tr: TransferRecord): string {
     case 'transferring':
       return tr.direction === 'send' ? `Streaming to ${tr.peerName}` : `Pulling from ${tr.peerName}`;
     case 'flushing':
-      return 'Flushing final bytes to disk…';
+      return 'Verifying 16 KB block bitmap & flushing to storage…';
     case 'paused':
       return 'Transfer paused';
     case 'completed':
       return tr.direction === 'receive'
         ? tr.savedVia === 'filesystem-handle'
-          ? 'Written directly to chosen file'
-          : 'Saved via OPFS stream download'
+          ? 'Written directly to chosen OS file'
+          : tr.sink === 'ram-arena'
+            ? 'Received in RAM Turbo Arena & saved'
+            : 'Saved via OPFS stream download'
         : `Delivered to ${tr.peerName}`;
     case 'declined':
       return 'Offer declined';
@@ -42,6 +44,23 @@ function describeStatus(tr: TransferRecord): string {
       return tr.errorMessage || 'Transfer cancelled';
     case 'failed':
       return tr.errorMessage || 'Transfer interrupted';
+  }
+}
+
+function sinkBadgeLabel(sink: SinkKind): string {
+  switch (sink) {
+    case 'ram-arena':
+      return 'RAM Turbo';
+    case 'direct-handle':
+      return 'Direct Disk';
+    case 'opfs-sync':
+      return 'OPFS Sync';
+    case 'opfs-writable':
+      return 'OPFS Stream';
+    case 'memory':
+      return 'Bounded RAM';
+    case 'discard':
+      return 'Discard';
   }
 }
 
@@ -125,8 +144,17 @@ export const TransferQueue: React.FC<TransferQueueProps> = ({
                 </span>
               </div>
 
-              {/* Technical Badges: Entropy, Compression, Dynamic Chunk/Lanes, Sink, Route, Integrity */}
+              {/* Technical Badges: Transport, Entropy, Compression, Dynamic Chunk/Lanes, Sink, Route, Integrity */}
               <div className="mt-2 flex flex-wrap items-center gap-1.5 font-mono text-[10px] text-ink-tertiary">
+                <span
+                  className={`rounded border px-1.5 py-0.5 ${
+                    tr.transport === 'blast-nack'
+                      ? 'border-lime-signal/35 bg-lime-signal/10 text-lime-signal'
+                      : 'border-cyan-ice/30 bg-cyan-warp/12 text-cyan-ice'
+                  }`}
+                >
+                  {tr.transport === 'blast-nack' ? 'Blast+NACK' : 'Rel-SCTP'}
+                </span>
                 <span className="rounded border border-white/10 bg-black/35 px-1.5 py-0.5">
                   H={tr.entropy.toFixed(2)} b/B
                 </span>
@@ -143,12 +171,14 @@ export const TransferQueue: React.FC<TransferQueueProps> = ({
                   </span>
                 )}
                 {tr.sink && tr.sink !== 'discard' && (
-                  <span className="rounded border border-white/10 bg-black/35 px-1.5 py-0.5">
-                    {tr.sink === 'opfs-sync'
-                      ? 'OPFS Sync'
-                      : tr.sink === 'opfs-writable'
-                        ? 'OPFS Stream'
-                        : 'Bounded RAM'}
+                  <span
+                    className={`rounded border px-1.5 py-0.5 ${
+                      tr.sink === 'ram-arena' || tr.sink === 'direct-handle'
+                        ? 'border-cyan-ice/35 bg-cyan-warp/12 text-cyan-ice'
+                        : 'border-white/10 bg-black/35'
+                    }`}
+                  >
+                    {sinkBadgeLabel(tr.sink)}
                   </span>
                 )}
                 {tr.route !== 'unknown' && (
@@ -215,7 +245,8 @@ export const TransferQueue: React.FC<TransferQueueProps> = ({
 
                   <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-ink-secondary">
                     <span className="tabular-nums font-mono">
-                      {formatBytes(tr.bytesTransferred)} / {formatBytes(tr.fileSize)} ({tr.status === 'completed' ? 100 : pct}%)
+                      {formatBytes(tr.bytesTransferred)} / {formatBytes(tr.fileSize)} (
+                      {tr.status === 'completed' ? 100 : pct}%)
                     </span>
 
                     <div className="flex items-center gap-2">

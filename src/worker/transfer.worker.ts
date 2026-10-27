@@ -1,20 +1,22 @@
 /**
- * Dedicated off-main-thread transfer & benchmark worker.
+ * Dedicated off-main-thread transfer, RAM-cache, NACK-blast & benchmark worker.
  *
- * Sender pipeline:
- *   OS File (8 MiB double-buffered macro-reads) or synthetic benchmark buffer →
- *   16 KiB block order-independent integrity hash →
- *   AdaptiveTuner (16..256 KiB chunk ladder + parallel SCTP lanes + BDP watermark) →
- *   optional WASM LZ4 block compression with auto-bypass →
- *   application-level receiver credit gate + local SCTP watermark gate →
- *   zero-allocation native RTCDataChannel send (or transferable ArrayBuffer bridge).
- *
- * Receiver pipeline:
- *   bounded MessageChannel frame hand-off →
- *   8-byte header demux + optional WASM LZ4 decode →
- *   16 KiB block order-independent integrity hash →
- *   OPFS SyncAccessHandle / bounded async OPFS Writable / DiscardSink →
- *   persisted-bytes credit ACKs (`credit-out`) back to sender.
+ * Key subsystems:
+ *   1. `SharedBlockCache`: 64–96 MiB LRU macro-block RAM cache + full-RAM preload
+ *      for small/medium files. Eliminates duplicate disk reads across multi-peer
+ *      sends and serves NACK block repairs from RAM in < 0.01 ms.
+ *   2. Dual Transport Pools per Link:
+ *        • `pool`      — Reliable Unordered (`ordered: false`)
+ *        • `blastPool` — RBUDP Blast Unordered (`ordered: false, maxRetransmits: 0`)
+ *      In `blast-nack` mode, Pass 1 streams continuously over `blastPool` (zero
+ *      dcSCTP C++ `rwnd` reassembly stalls), while rolling + end-of-pass 16 KiB
+ *      `BlockBitmap` NACKs selectively retransmit ONLY dropped blocks over the
+ *      reliable `pool`!
+ *   3. Multi-Peer Fair Mesh Pacing: scales watermarks across simultaneous peer
+ *      transfers and applies Shortest-Remaining-Processing-Time (SRPT) priority so
+ *      small files complete immediately alongside multi-GB transfers.
+ *   4. 3-Tier Receiver Sink (`ram-arena` → `direct-handle` → coalesced `opfs-sync`)
+ *      with idempotent `BlockBitmap` deduplication and 128-bit `OrderIndependentHasher`.
  */
 import {
   AdaptiveTuner,
@@ -28,6 +30,7 @@ import { ChannelPool } from '../engine/channelPool';
 import { analyzeBlob } from '../engine/entropy';
 import { decodeFrame, encodeFrame, writeFrameHeader } from '../engine/framing';
 import { OrderIndependentHasher } from '../engine/integrity';
+import { BLOCK_BYTES, BlockBitmap, type MissingRange } from '../engine/nackBitmap';
 import {
   openDiskSink,
   opfsSupported,
@@ -44,6 +47,7 @@ import {
   FRAME_HEADER_BYTES,
   INITIAL_HIGH_WATERMARK,
   MAX_CHUNK,
+  type ActiveTransportKind,
   type FromWorker,
   type SchedulePolicy,
   type TuneConfig,
@@ -62,14 +66,65 @@ const post = (message: FromWorker, transfer: Transferable[] = []) => scope.postM
 
 const PROGRESS_INTERVAL_MS = 100;
 const DISK_MACRO_BYTES = 8 * 1024 * 1024;
-const EPOCH_MIN_MS = 550;
+const EPOCH_MIN_MS = 420;
 const RX_SLICE_BUDGET_MS = 6;
+const ROLLING_NACK_STRIDE_BLOCKS = 1024; // Scan every 16 MiB of progress
+const ROLLING_REORDER_MARGIN_BLOCKS = 256; // 4 MiB reorder safety margin across unordered channels
 
 const deviceProfile = detectDeviceProfile();
 const scratchFrame = new ArrayBuffer(MAX_CHUNK + FRAME_HEADER_BYTES + 64);
 
 let codec: Lz4Codec | null = null;
 let lz4Error: string | undefined;
+
+// ───────────────────── Shared Sender RAM Macro-Block Cache ─────────────────────
+
+interface CachedMacro {
+  key: string;
+  buf: ArrayBuffer;
+  touchedAt: number;
+}
+
+class SharedBlockCache {
+  private readonly entries = new Map<string, CachedMacro>();
+  private seq = 0;
+  private readonly maxEntries: number;
+
+  constructor(maxBudgetBytes: number) {
+    this.maxEntries = Math.max(4, Math.floor(maxBudgetBytes / DISK_MACRO_BYTES));
+  }
+
+  get(key: string): ArrayBuffer | null {
+    const hit = this.entries.get(key);
+    if (!hit) return null;
+    hit.touchedAt = ++this.seq;
+    return hit.buf;
+  }
+
+  put(key: string, buf: ArrayBuffer): void {
+    const existing = this.entries.get(key);
+    if (existing) {
+      existing.buf = buf;
+      existing.touchedAt = ++this.seq;
+      return;
+    }
+    while (this.entries.size >= this.maxEntries) {
+      let oldestKey: string | null = null;
+      let oldestTouch = Number.POSITIVE_INFINITY;
+      for (const [k, v] of this.entries) {
+        if (v.touchedAt < oldestTouch) {
+          oldestTouch = v.touchedAt;
+          oldestKey = k;
+        }
+      }
+      if (oldestKey) this.entries.delete(oldestKey);
+      else break;
+    }
+    this.entries.set(key, { key, buf, touchedAt: ++this.seq });
+  }
+}
+
+const sharedBlockCache = new SharedBlockCache(deviceProfile.mobile ? 32 * 1024 * 1024 : 96 * 1024 * 1024);
 
 // Cached synthetic 8 MiB macro-buffers for zero-disk benchmark runs
 let cachedRandomMacro: ArrayBuffer | null = null;
@@ -106,13 +161,20 @@ function getSyntheticMacro(compressible: boolean): ArrayBuffer {
 
 interface LinkState {
   id: string;
-  /** Present when RTCDataChannels are transferred natively into this worker. */
+  /** Reliable unordered DataChannel pool (`ordered: false`). */
   pool: ChannelPool | null;
+  /** Blast UDP DataChannel pool (`ordered: false, maxRetransmits: 0`). */
+  blastPool: ChannelPool | null;
   paused: boolean;
+  blastPaused: boolean;
   inFlightBytes: number;
+  blastInFlightBytes: number;
   bridgeSentBytes: number;
   bridgeBuffered: number[];
   bridgeOpenLanes: number;
+  blastBridgeSentBytes: number;
+  blastBridgeBuffered: number[];
+  blastBridgeOpenLanes: number;
   resumeWaiters: Array<() => void>;
   rttMs: number;
   maxMessageSize: number;
@@ -128,11 +190,17 @@ function getLink(linkId: string): LinkState {
     link = {
       id: linkId,
       pool: null,
+      blastPool: null,
       paused: false,
+      blastPaused: false,
       inFlightBytes: 0,
+      blastInFlightBytes: 0,
       bridgeSentBytes: 0,
       bridgeBuffered: [0, 0, 0, 0],
       bridgeOpenLanes: 1,
+      blastBridgeSentBytes: 0,
+      blastBridgeBuffered: [0, 0, 0, 0],
+      blastBridgeOpenLanes: 1,
       resumeWaiters: [],
       rttMs: 0,
       maxMessageSize: MAX_CHUNK + FRAME_HEADER_BYTES + 64,
@@ -150,17 +218,27 @@ function releaseWaiters(link: LinkState): void {
   for (const resolve of waiters) resolve();
 }
 
-function openLanesFor(link: LinkState, forceBridge: boolean): number {
-  if (link.pool && !forceBridge) return Math.max(1, link.pool.openLaneCount);
-  return Math.max(1, link.bridgeOpenLanes);
+function activePoolFor(link: LinkState, transport: ActiveTransportKind, forceBridge: boolean): ChannelPool | null {
+  if (forceBridge) return null;
+  if (transport === 'blast-nack' && link.blastPool && link.blastPool.isOpen) return link.blastPool;
+  return link.pool;
+}
+
+function openLanesFor(link: LinkState, transport: ActiveTransportKind, forceBridge: boolean): number {
+  const p = activePoolFor(link, transport, forceBridge);
+  if (p) return Math.max(1, p.openLaneCount);
+  return Math.max(1, transport === 'blast-nack' ? link.blastBridgeOpenLanes : link.bridgeOpenLanes);
 }
 
 function drainedBytesOnLink(link: LinkState, forceBridge: boolean): number {
-  if (link.pool && !forceBridge) {
-    return Math.max(0, link.pool.sentBytes - link.pool.totalBuffered);
+  if ((link.pool || link.blastPool) && !forceBridge) {
+    const relDrained = link.pool ? Math.max(0, link.pool.sentBytes - link.pool.totalBuffered) : 0;
+    const blastDrained = link.blastPool ? Math.max(0, link.blastPool.sentBytes - link.blastPool.totalBuffered) : 0;
+    return relDrained + blastDrained;
   }
-  const bufferedSum = link.bridgeBuffered.reduce((a, b) => a + b, 0);
-  return Math.max(0, link.bridgeSentBytes - bufferedSum);
+  const relBuf = link.bridgeBuffered.reduce((a, b) => a + b, 0);
+  const blastBuf = link.blastBridgeBuffered.reduce((a, b) => a + b, 0);
+  return Math.max(0, link.bridgeSentBytes - relBuf) + Math.max(0, link.blastBridgeSentBytes - blastBuf);
 }
 
 // ───────────────────────────── Sender ─────────────────────────────
@@ -169,18 +247,26 @@ interface SendJob {
   id: string;
   linkId: string;
   file: File | null;
+  fileCachePrefix: string;
+  preloadedMacros: Map<number, ArrayBuffer> | null;
   syntheticBytes?: number;
   compressibleBench: boolean;
   forceBridge: boolean;
   compress: boolean;
+  transport: ActiveTransportKind;
   creditWindow: number;
   creditedBytes: number;
   creditWaiters: Array<() => void>;
+  ramPreloadBudget: number;
   durationMs?: number;
   pinned?: Partial<TuneConfig> | null;
   cancelled: boolean;
   userPaused: boolean;
   pauseWaiters: Array<() => void>;
+  repairQueue: MissingRange[];
+  repairWaiters: Array<() => void>;
+  finalAuditComplete: boolean;
+  retransmittedBlocks: number;
   rawBytes: number;
   wireBytes: number;
   lastProgress: number;
@@ -195,6 +281,12 @@ function releaseCredits(job: SendJob): void {
   for (const resolve of waiters) resolve();
 }
 
+function releaseRepairWaiters(job: SendJob): void {
+  const waiters = job.repairWaiters;
+  job.repairWaiters = [];
+  for (const resolve of waiters) resolve();
+}
+
 async function waitForOpen(pool: ChannelPool, job: SendJob): Promise<void> {
   const deadline = performance.now() + 15_000;
   while (!pool.isOpen) {
@@ -204,24 +296,43 @@ async function waitForOpen(pool: ChannelPool, job: SendJob): Promise<void> {
   }
 }
 
-function syncTuneToPoolOrBridge(link: LinkState, cfg: TuneConfig, forceBridge: boolean): void {
+/** Fair multi-peer watermark share when 2+ outbound transfers run concurrently. */
+function fairWatermarkFor(rawWatermark: number, job: SendJob): number {
+  const peersActive = Math.max(1, sendJobs.size);
+  if (peersActive <= 1) return rawWatermark;
+  // SRPT boost: small files (<= 16 MiB) keep full responsiveness while bulk transfers share BDP fairly.
+  if (job.file && job.file.size <= 16 * 1024 * 1024) return rawWatermark;
+  return Math.max(512 * 1024, Math.floor(rawWatermark / Math.sqrt(peersActive)));
+}
+
+function syncTuneToPoolOrBridge(
+  link: LinkState,
+  cfg: TuneConfig,
+  transport: ActiveTransportKind,
+  forceBridge: boolean,
+  effectiveWatermark: number,
+): void {
   const channels = cfg.channels ?? CHANNEL_COUNT;
   const schedule: SchedulePolicy = cfg.schedule ?? 'least-buffered';
-  if (link.pool && !forceBridge) {
-    link.pool.setActiveLanes(cfg.lanes);
-    link.pool.setActiveChannelsPerLane(channels);
-    link.pool.setSchedulePolicy(schedule);
-    link.pool.setHighWatermark(cfg.highWatermark);
+  if (!forceBridge) {
+    for (const p of [link.pool, link.blastPool]) {
+      if (!p) continue;
+      p.setActiveLanes(cfg.lanes);
+      p.setActiveChannelsPerLane(channels);
+      p.setSchedulePolicy(schedule);
+      p.setHighWatermark(effectiveWatermark);
+    }
   }
   const activeChannelTotal = channels + Math.max(0, cfg.lanes - 1) * 2;
   post({
     type: 'tune',
     linkId: link.id,
-    highWatermark: cfg.highWatermark,
-    lowWatermark: lowWatermarkFor(cfg.highWatermark, activeChannelTotal),
+    highWatermark: effectiveWatermark,
+    lowWatermark: lowWatermarkFor(effectiveWatermark, activeChannelTotal),
     lanes: cfg.lanes,
     channels,
     schedule,
+    transport,
   });
 }
 
@@ -229,6 +340,7 @@ async function gate(
   link: LinkState,
   job: SendJob,
   highWatermark: number,
+  useBlastChannel: boolean,
 ): Promise<{ queueMs: number; creditMs: number }> {
   let queueMs = 0;
   let creditMs = 0;
@@ -238,7 +350,7 @@ async function gate(
   }
   if (job.cancelled) return { queueMs, creditMs };
 
-  // 1. Application-level receiver credit gate (protects async OPFS & mobile RAM).
+  // 1. Application-level receiver credit gate.
   if (Number.isFinite(job.creditWindow)) {
     while (!job.cancelled && job.rawBytes - job.creditedBytes >= job.creditWindow) {
       const t0 = performance.now();
@@ -252,10 +364,16 @@ async function gate(
   if (job.cancelled) return { queueMs, creditMs };
 
   // 2. Local browser SCTP send-buffer watermark gate.
-  if (link.pool && !job.forceBridge) {
-    while (!job.cancelled && !link.pool.canSend) {
+  const targetPool = !job.forceBridge
+    ? useBlastChannel && link.blastPool && link.blastPool.isOpen
+      ? link.blastPool
+      : link.pool
+    : null;
+
+  if (targetPool) {
+    while (!job.cancelled && !targetPool.canSend) {
       const t0 = performance.now();
-      await link.pool.waitForDrain();
+      await targetPool.waitForDrain();
       queueMs += performance.now() - t0;
       while (!job.cancelled && job.userPaused) {
         await new Promise<void>((resolve) => job.pauseWaiters.push(resolve));
@@ -264,7 +382,10 @@ async function gate(
     return { queueMs, creditMs };
   }
 
-  while (!job.cancelled && (link.paused || link.inFlightBytes >= highWatermark)) {
+  const isPaused = () => (useBlastChannel ? link.blastPaused : link.paused);
+  const inFlight = () => (useBlastChannel ? link.blastInFlightBytes : link.inFlightBytes);
+
+  while (!job.cancelled && (isPaused() || inFlight() >= highWatermark)) {
     const t0 = performance.now();
     await new Promise<void>((resolve) => link.resumeWaiters.push(resolve));
     queueMs += performance.now() - t0;
@@ -289,6 +410,178 @@ function emitSendProgress(job: SendJob, tuner: AdaptiveTuner, useLz4: boolean, f
   });
 }
 
+async function readJobMacro(job: SendJob, macroOffset: number, totalLimit: number): Promise<ArrayBuffer> {
+  const length = Math.min(DISK_MACRO_BYTES, totalLimit - macroOffset);
+  if (!job.file) {
+    const synth = getSyntheticMacro(job.compressibleBench);
+    return length >= synth.byteLength ? synth : synth.slice(0, length);
+  }
+  const macroIdx = Math.floor(macroOffset / DISK_MACRO_BYTES);
+  const preloaded = job.preloadedMacros?.get(macroIdx);
+  if (preloaded) return preloaded;
+
+  const cacheKey = `${job.fileCachePrefix}:${macroIdx}`;
+  const cached = sharedBlockCache.get(cacheKey);
+  if (cached && cached.byteLength === length) return cached;
+
+  const buf = await job.file.slice(macroOffset, macroOffset + length).arrayBuffer();
+  sharedBlockCache.put(cacheKey, buf);
+  if (job.preloadedMacros) job.preloadedMacros.set(macroIdx, buf);
+  return buf;
+}
+
+/** Sends a single payload slice over either the native worker ChannelPool or the UI bridge. */
+function transmitSlice(
+  link: LinkState,
+  job: SendJob,
+  fileOffset: number,
+  raw: Uint8Array,
+  useLz4: boolean,
+  useBlastChannel: boolean,
+): { wireLength: number; lz4Ms: number } {
+  const targetPool = !job.forceBridge
+    ? useBlastChannel && link.blastPool && link.blastPool.isOpen
+      ? link.blastPool
+      : link.pool
+    : null;
+  let lz4Ms = 0;
+  let wireLength = 0;
+
+  if (useLz4 && codec) {
+    const c0 = performance.now();
+    const compressedFrame = codec.compressFrame(raw, FRAME_HEADER_BYTES);
+    lz4Ms = performance.now() - c0;
+
+    if (compressedFrame.byteLength < FRAME_HEADER_BYTES + raw.byteLength * 0.96) {
+      writeFrameHeader(compressedFrame, fileOffset, true);
+      wireLength = compressedFrame.byteLength;
+      if (targetPool) {
+        if (!targetPool.send(compressedFrame)) throw new Error('All data channels closed');
+      } else {
+        if (useBlastChannel) link.blastInFlightBytes += wireLength;
+        else link.inFlightBytes += wireLength;
+        post(
+          {
+            type: 'frame-out',
+            linkId: job.linkId,
+            transferId: job.id,
+            data: compressedFrame,
+            blast: useBlastChannel,
+            viaForceBridge: job.forceBridge,
+          },
+          [compressedFrame],
+        );
+      }
+      return { wireLength, lz4Ms };
+    }
+  }
+
+  if (targetPool) {
+    writeFrameHeader(scratchFrame, fileOffset, false);
+    new Uint8Array(scratchFrame, FRAME_HEADER_BYTES, raw.byteLength).set(raw);
+    wireLength = FRAME_HEADER_BYTES + raw.byteLength;
+    if (!targetPool.send(new Uint8Array(scratchFrame, 0, wireLength))) {
+      throw new Error('All data channels closed');
+    }
+  } else {
+    const frame = encodeFrame(fileOffset, raw, false);
+    wireLength = frame.byteLength;
+    if (useBlastChannel) link.blastInFlightBytes += wireLength;
+    else link.inFlightBytes += wireLength;
+    post(
+      {
+        type: 'frame-out',
+        linkId: job.linkId,
+        transferId: job.id,
+        data: frame,
+        blast: useBlastChannel,
+        viaForceBridge: job.forceBridge,
+      },
+      [frame],
+    );
+  }
+  return { wireLength, lz4Ms };
+}
+
+/**
+ * Selectively retransmits missing 16 KiB blocks reported via receiver Bitmap NACKs.
+ * Always transmits repairs over the RELIABLE unordered `pool` (`useBlastChannel = false`)
+ * so repaired blocks are guaranteed to arrive without recursive re-drops!
+ */
+async function drainRepairQueue(
+  link: LinkState,
+  job: SendJob,
+  totalLimit: number,
+  useLz4: boolean,
+  watermark: number,
+  maxBlocksThisTurn = Number.POSITIVE_INFINITY,
+): Promise<{ queueMs: number; diskMs: number; lz4Ms: number }> {
+  let queueMs = 0;
+  let diskMs = 0;
+  let lz4Ms = 0;
+  let sentBlocks = 0;
+
+  while (job.repairQueue.length > 0 && sentBlocks < maxBlocksThisTurn && !job.cancelled) {
+    const range = job.repairQueue[0];
+    const startBlock = range[0];
+    const count = range[1];
+    if (count <= 0) {
+      job.repairQueue.shift();
+      continue;
+    }
+
+    const blockOffset = startBlock * BLOCK_BYTES;
+    if (blockOffset >= totalLimit) {
+      job.repairQueue.shift();
+      continue;
+    }
+
+    const macroIndex = Math.floor(blockOffset / DISK_MACRO_BYTES);
+    const macroStart = macroIndex * DISK_MACRO_BYTES;
+    const d0 = performance.now();
+    const macroBuf = await readJobMacro(job, macroStart, totalLimit);
+    diskMs += performance.now() - d0;
+
+    // Coalesce up to 2 contiguous missing blocks (32 KiB) per reliable repair frame inside the same macro-block
+    const maxBlocksInMacro = Math.ceil((macroStart + macroBuf.byteLength - blockOffset) / BLOCK_BYTES);
+    const batchBlocks = Math.max(1, Math.min(2, count, maxBlocksInMacro, maxBlocksThisTurn - sentBlocks));
+    const byteInMacro = blockOffset - macroStart;
+    const byteLen = Math.min(batchBlocks * BLOCK_BYTES, macroBuf.byteLength - byteInMacro, totalLimit - blockOffset);
+
+    // Repairs bypass receiver credit gate (blocks were already accounted in Pass 1 rawBytes) and use reliable pool
+    if (link.pool && !job.forceBridge) {
+      while (!job.cancelled && !link.pool.canSend) {
+        const q0 = performance.now();
+        await link.pool.waitForDrain();
+        queueMs += performance.now() - q0;
+      }
+    } else {
+      while (!job.cancelled && (link.paused || link.inFlightBytes >= watermark)) {
+        const q0 = performance.now();
+        await new Promise<void>((r) => link.resumeWaiters.push(r));
+        queueMs += performance.now() - q0;
+      }
+    }
+    if (job.cancelled) break;
+
+    const slice = new Uint8Array(macroBuf, byteInMacro, byteLen);
+    const tx = transmitSlice(link, job, blockOffset, slice, useLz4, false);
+    job.wireBytes += tx.wireLength;
+    lz4Ms += tx.lz4Ms;
+    job.retransmittedBlocks += batchBlocks;
+    sentBlocks += batchBlocks;
+
+    if (batchBlocks >= count) {
+      job.repairQueue.shift();
+    } else {
+      range[0] = startBlock + batchBlocks;
+      range[1] = count - batchBlocks;
+    }
+  }
+
+  return { queueMs, diskMs, lz4Ms };
+}
+
 async function runSend(job: SendJob): Promise<void> {
   const link = getLink(job.linkId);
   const isBench = job.file === null;
@@ -296,17 +589,42 @@ async function runSend(job: SendJob): Promise<void> {
   let useLz4 = job.compress && codec !== null;
   if (job.compress && !codec) throw new Error('LZ4 codec unavailable in sender worker');
 
-  if (link.pool && !job.forceBridge) await waitForOpen(link.pool, job);
+  const initialPool = activePoolFor(link, job.transport, job.forceBridge);
+  if (initialPool) await waitForOpen(initialPool, job);
+
+  const useBlast =
+    job.transport === 'blast-nack' &&
+    (job.forceBridge ? link.blastBridgeOpenLanes > 0 : link.blastPool !== null && link.blastPool.isOpen);
+  const effectiveTransport: ActiveTransportKind = useBlast ? 'blast-nack' : 'reliable-sctp';
+  job.transport = effectiveTransport;
 
   const maxChunkInit = largestChunkFor(link.maxMessageSize, FRAME_HEADER_BYTES);
   const tuner = new AdaptiveTuner(
     deviceProfile,
     maxChunkInit,
-    openLanesFor(link, job.forceBridge),
+    openLanesFor(link, effectiveTransport, job.forceBridge),
     link.seed,
+    effectiveTransport,
   );
   if (job.pinned) tuner.pin(job.pinned);
-  syncTuneToPoolOrBridge(link, tuner.config, job.forceBridge);
+  syncTuneToPoolOrBridge(
+    link,
+    tuner.config,
+    effectiveTransport,
+    job.forceBridge,
+    fairWatermarkFor(tuner.config.highWatermark, job),
+  );
+
+  // Optional background RAM preload for files within `ramPreloadBudget` (zero disk wait!)
+  if (job.file && job.file.size > 0 && job.file.size <= job.ramPreloadBudget) {
+    job.preloadedMacros = new Map();
+    const preloadTarget = job.file;
+    void (async () => {
+      for (let off = 0; off < preloadTarget.size && !job.cancelled; off += DISK_MACRO_BYTES) {
+        await readJobMacro(job, off, preloadTarget.size).catch(() => undefined);
+      }
+    })();
+  }
 
   const startedAt = performance.now();
   const stopDeadline = job.durationMs ? startedAt + job.durationMs : Number.POSITIVE_INFINITY;
@@ -322,18 +640,11 @@ async function runSend(job: SendJob): Promise<void> {
   let totalCreditMs = 0;
   let totalDiskMs = 0;
   let totalLz4Ms = 0;
-
-  const readMacro = (offset: number, length: number): Promise<ArrayBuffer> => {
-    if (!job.file) {
-      const synth = getSyntheticMacro(job.compressibleBench);
-      return Promise.resolve(length >= synth.byteLength ? synth : synth.slice(0, length));
-    }
-    return job.file.slice(offset, offset + length).arrayBuffer();
-  };
+  let bytesSinceYield = 0;
 
   let macroOffset = 0;
   let pendingMacro: Promise<ArrayBuffer> | null =
-    totalLimit > 0 ? readMacro(0, Math.min(DISK_MACRO_BYTES, totalLimit)) : null;
+    totalLimit > 0 ? readJobMacro(job, 0, totalLimit) : null;
 
   outer: while (macroOffset < totalLimit && pendingMacro) {
     if (job.cancelled || performance.now() >= stopDeadline) break;
@@ -351,7 +662,7 @@ async function runSend(job: SendJob): Promise<void> {
 
     pendingMacro =
       nextMacroOffset < totalLimit && performance.now() < stopDeadline
-        ? readMacro(nextMacroOffset, Math.min(DISK_MACRO_BYTES, totalLimit - nextMacroOffset))
+        ? readJobMacro(job, nextMacroOffset, totalLimit)
         : null;
 
     let innerOffset = 0;
@@ -359,7 +670,20 @@ async function runSend(job: SendJob): Promise<void> {
       if (job.cancelled) return;
       if (performance.now() >= stopDeadline) break outer;
 
-      const waits = await gate(link, job, tuner.config.highWatermark);
+      const effectiveWM = fairWatermarkFor(tuner.config.highWatermark, job);
+
+      // Interleave any rolling NACK block repairs immediately over reliable pool!
+      if (job.repairQueue.length > 0) {
+        const rep = await drainRepairQueue(link, job, job.rawBytes, useLz4, effectiveWM, 32);
+        epochQueueMs += rep.queueMs;
+        epochDiskMs += rep.diskMs;
+        epochLz4Ms += rep.lz4Ms;
+        totalQueueMs += rep.queueMs;
+        totalDiskMs += rep.diskMs;
+        totalLz4Ms += rep.lz4Ms;
+      }
+
+      const waits = await gate(link, job, effectiveWM, effectiveTransport === 'blast-nack');
       epochQueueMs += waits.queueMs;
       epochCreditMs += waits.creditMs;
       totalQueueMs += waits.queueMs;
@@ -367,91 +691,49 @@ async function runSend(job: SendJob): Promise<void> {
       if (job.cancelled) return;
       if (performance.now() >= stopDeadline) break outer;
 
-      // Refresh dynamic SCTP / lane ceilings in case an extra parallel lane just opened.
       if (
         tuner.setLimits(
           largestChunkFor(link.maxMessageSize, FRAME_HEADER_BYTES),
-          openLanesFor(link, job.forceBridge),
+          openLanesFor(link, effectiveTransport, job.forceBridge),
         )
       ) {
-        syncTuneToPoolOrBridge(link, tuner.config, job.forceBridge);
+        syncTuneToPoolOrBridge(
+          link,
+          tuner.config,
+          effectiveTransport,
+          job.forceBridge,
+          fairWatermarkFor(tuner.config.highWatermark, job),
+        );
       }
 
       const chunkLen = Math.min(tuner.config.chunk, macroBuf.byteLength - innerOffset);
       const raw = new Uint8Array(macroBuf, innerOffset, chunkLen);
       const fileOffset = macroOffset + innerOffset;
 
-      // Order-independent 16 KB sub-block integrity hash
+      // Hash each logical file byte range ONCE during Pass 1
       job.hasher.update(fileOffset, raw);
 
-      const useNativeZeroAlloc = link.pool !== null && !job.forceBridge;
-      let wireLength = 0;
-
-      if (useLz4) {
-        const c0 = performance.now();
-        const compressedFrame = codec!.compressFrame(raw, FRAME_HEADER_BYTES);
-        const cElapsed = performance.now() - c0;
-        epochLz4Ms += cElapsed;
-        totalLz4Ms += cElapsed;
-
-        if (compressedFrame.byteLength < FRAME_HEADER_BYTES + raw.byteLength * 0.96) {
-          writeFrameHeader(compressedFrame, fileOffset, true);
-          wireLength = compressedFrame.byteLength;
-          if (useNativeZeroAlloc) {
-            if (!link.pool!.send(compressedFrame)) throw new Error('All data channels closed');
-          } else {
-            link.inFlightBytes += wireLength;
-            post(
-              { type: 'frame-out', linkId: job.linkId, transferId: job.id, data: compressedFrame, viaForceBridge: job.forceBridge },
-              [compressedFrame],
-            );
-          }
-        } else if (useNativeZeroAlloc) {
-          writeFrameHeader(scratchFrame, fileOffset, false);
-          new Uint8Array(scratchFrame, FRAME_HEADER_BYTES, raw.byteLength).set(raw);
-          wireLength = FRAME_HEADER_BYTES + raw.byteLength;
-          if (!link.pool!.send(new Uint8Array(scratchFrame, 0, wireLength))) {
-            throw new Error('All data channels closed');
-          }
-        } else {
-          const frame = encodeFrame(fileOffset, raw, false);
-          wireLength = frame.byteLength;
-          link.inFlightBytes += wireLength;
-          post(
-            { type: 'frame-out', linkId: job.linkId, transferId: job.id, data: frame, viaForceBridge: job.forceBridge },
-            [frame],
-          );
-        }
-      } else if (useNativeZeroAlloc) {
-        // Hot path for pre-compressed media / archives / raw benchmarks: zero ArrayBuffer allocations per chunk.
-        writeFrameHeader(scratchFrame, fileOffset, false);
-        new Uint8Array(scratchFrame, FRAME_HEADER_BYTES, raw.byteLength).set(raw);
-        wireLength = FRAME_HEADER_BYTES + raw.byteLength;
-        if (!link.pool!.send(new Uint8Array(scratchFrame, 0, wireLength))) {
-          throw new Error('All data channels closed');
-        }
-      } else {
-        const frame = encodeFrame(fileOffset, raw, false);
-        wireLength = frame.byteLength;
-        link.inFlightBytes += wireLength;
-        post(
-          { type: 'frame-out', linkId: job.linkId, transferId: job.id, data: frame, viaForceBridge: job.forceBridge },
-          [frame],
-        );
-      }
-
+      const tx = transmitSlice(link, job, fileOffset, raw, useLz4, effectiveTransport === 'blast-nack');
       innerOffset += chunkLen;
       job.rawBytes = fileOffset + chunkLen;
-      job.wireBytes += wireLength;
+      job.wireBytes += tx.wireLength;
+      epochLz4Ms += tx.lz4Ms;
+      totalLz4Ms += tx.lz4Ms;
 
-      // Auto-bypass LZ4 if after 2 MiB the stream proves incompressible (< 1.05x).
+      // Multi-peer cooperative fairness yield every 512 KiB when multiple transfers are active
+      bytesSinceYield += chunkLen;
+      if (sendJobs.size > 1 && bytesSinceYield >= 512 * 1024 && (!job.file || job.file.size > 16 * 1024 * 1024)) {
+        bytesSinceYield = 0;
+        await new Promise((r) => setTimeout(r, 0));
+      }
+
       if (useLz4 && !job.pinned && job.rawBytes >= 2 * 1024 * 1024 && job.rawBytes / job.wireBytes < 1.05) {
         useLz4 = false;
       }
 
       const now = performance.now();
       const epochElapsed = now - epochStart;
-      const minEpoch = Math.max(EPOCH_MIN_MS, Math.min(2_000, link.rttMs * 6));
+      const minEpoch = Math.max(EPOCH_MIN_MS, Math.min(1_500, link.rttMs * 4));
       if (epochElapsed >= minEpoch) {
         const drainedNow = drainedBytesOnLink(link, job.forceBridge);
         const changed = tuner.onEpoch({
@@ -462,8 +744,17 @@ async function runSend(job: SendJob): Promise<void> {
           diskWaitMs: epochDiskMs,
           lz4Ms: epochLz4Ms,
           rttMs: link.rttMs,
+          retransmittedBlocks: job.retransmittedBlocks,
         });
-        if (changed) syncTuneToPoolOrBridge(link, tuner.config, job.forceBridge);
+        if (changed) {
+          syncTuneToPoolOrBridge(
+            link,
+            tuner.config,
+            effectiveTransport,
+            job.forceBridge,
+            fairWatermarkFor(tuner.config.highWatermark, job),
+          );
+        }
         lastDrained = drainedNow;
         epochStart = now;
         epochQueueMs = 0;
@@ -478,19 +769,64 @@ async function runSend(job: SendJob): Promise<void> {
     macroOffset = nextMacroOffset;
   }
 
-  if (link.pool && !job.forceBridge) {
+  // Flush Pass 1 send buffers
+  if (!job.forceBridge) {
     const f0 = performance.now();
-    await link.pool.flush();
+    if (link.blastPool) await link.blastPool.flush();
+    if (link.pool) await link.pool.flush();
     totalQueueMs += performance.now() - f0;
   }
   if (job.cancelled) return;
 
-  // Persist learned optimal configuration for subsequent transfers on this link if unpinned.
+  const senderHash = job.hasher.digestHex();
+
+  // Blast-NACK End-of-Pass Audit & Selective Missing-Block Repair Loop
+  if (effectiveTransport === 'blast-nack' && job.rawBytes > 0) {
+    const finalByteCount = job.rawBytes;
+    let auditRound = 0;
+    while (!job.cancelled && !job.finalAuditComplete && auditRound < 12) {
+      auditRound++;
+      post({ type: 'blast-eof-out', transferId: job.id, totalBytes: finalByteCount, senderHash });
+
+      // Wait for receiver's final bitmap audit (`nack-in` with finalAudit=true)
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 2_500);
+        job.repairWaiters.push(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+
+      if (job.cancelled || job.finalAuditComplete) break;
+      if (job.repairQueue.length > 0) {
+        const effectiveWM = fairWatermarkFor(tuner.config.highWatermark, job);
+        const rep = await drainRepairQueue(link, job, finalByteCount, useLz4, effectiveWM);
+        totalQueueMs += rep.queueMs;
+        totalDiskMs += rep.diskMs;
+        totalLz4Ms += rep.lz4Ms;
+        if (link.pool && !job.forceBridge) {
+          const f0 = performance.now();
+          await link.pool.flush();
+          totalQueueMs += performance.now() - f0;
+        }
+        emitSendProgress(job, tuner, useLz4, true);
+      }
+    }
+  }
+
+  if (job.cancelled) return;
+
   if (!job.pinned && tuner.drainBps > 0) {
-    link.seed = { chunk: tuner.config.chunk, lanes: tuner.config.lanes, highWatermark: tuner.config.highWatermark };
+    link.seed = {
+      chunk: tuner.config.chunk,
+      lanes: tuner.config.lanes,
+      highWatermark: tuner.config.highWatermark,
+      transport: effectiveTransport,
+    };
   }
 
   const elapsedMs = Math.max(1, performance.now() - startedAt);
+  tuner.retransmittedBlocks = job.retransmittedBlocks;
   emitSendProgress(job, tuner, useLz4, true);
   post({
     type: 'send-drained',
@@ -502,7 +838,8 @@ async function runSend(job: SendJob): Promise<void> {
     creditWaitMs: totalCreditMs,
     diskWaitMs: totalDiskMs,
     lz4Ms: totalLz4Ms,
-    hash: job.hasher.digestHex(),
+    retransmittedBlocks: job.retransmittedBlocks,
+    hash: senderHash,
     finalTuner: tuner.snapshot(useLz4),
   });
 }
@@ -513,12 +850,17 @@ interface RecvJob {
   id: string;
   linkId: string;
   name: string;
+  mime: string;
   size: number;
   targetBytes: number;
   compress: boolean;
+  transport: ActiveTransportKind;
   bench: boolean;
   saveHandle: FileSystemFileHandle | null;
   sink: DiskSink | null;
+  bitmap: BlockBitmap;
+  nextRollingScanBlock: number;
+  blastEofReceived: boolean;
   creditWindow: number;
   creditStep: number;
   lastCreditedBytes: number;
@@ -587,10 +929,68 @@ function failRecv(job: RecvJob, message: string): void {
 
 function maybeEmitCredit(job: RecvJob): void {
   if (job.failed || job.finished) return;
-  if (job.persistedBytes - job.lastCreditedBytes >= job.creditStep) {
-    job.lastCreditedBytes = job.persistedBytes;
-    post({ type: 'credit-out', transferId: job.id, bytes: job.persistedBytes });
+  // In Blast-NACK mode, sender advances `rawBytes` monotonically across Pass 1 even when a few
+  // datagrams drop; adding the small gap inside the scanned window prevents credit deadlock.
+  const effectivePersisted =
+    job.transport === 'blast-nack'
+      ? Math.max(job.persistedBytes, Math.min(job.targetBytes, job.bitmap.highestBlock * BLOCK_BYTES))
+      : job.persistedBytes;
+  if (effectivePersisted - job.lastCreditedBytes >= job.creditStep) {
+    job.lastCreditedBytes = effectivePersisted;
+    post({ type: 'credit-out', transferId: job.id, bytes: effectivePersisted });
   }
+}
+
+function maybeEmitRollingNack(job: RecvJob): void {
+  if (job.transport !== 'blast-nack' || job.blastEofReceived || job.finished || job.failed) return;
+  const safeCeiling = job.bitmap.highestBlock - ROLLING_REORDER_MARGIN_BLOCKS;
+  if (safeCeiling - job.nextRollingScanBlock < ROLLING_NACK_STRIDE_BLOCKS) return;
+
+  const { ranges, nextScanBlock } = job.bitmap.findMissingRanges(job.nextRollingScanBlock, safeCeiling, 64);
+  job.nextRollingScanBlock = nextScanBlock;
+  if (ranges.length > 0) {
+    post({
+      type: 'nack-out',
+      transferId: job.id,
+      receivedBlocks: job.bitmap.receivedBlocks,
+      totalBlocks: job.bitmap.totalBlocks,
+      ranges,
+      finalAudit: false,
+    });
+  }
+}
+
+function performFinalBlastAudit(job: RecvJob): void {
+  if (job.finished || job.failed) return;
+  // Drain any frames already queued in rxQueue before auditing the bitmap!
+  while (rxQueue.length > 0) {
+    const item = rxQueue.shift()!;
+    handleIncoming(item.linkId, item.frame);
+  }
+  if (job.finished || job.failed) return;
+
+  if (job.bitmap.isComplete || job.targetBytes === 0) {
+    post({
+      type: 'nack-out',
+      transferId: job.id,
+      receivedBlocks: job.bitmap.receivedBlocks,
+      totalBlocks: job.bitmap.totalBlocks,
+      ranges: [],
+      finalAudit: true,
+    });
+    checkRecvCompletion(job);
+    return;
+  }
+
+  const { ranges } = job.bitmap.findMissingRanges(0, job.bitmap.totalBlocks, 256);
+  post({
+    type: 'nack-out',
+    transferId: job.id,
+    receivedBlocks: job.bitmap.receivedBlocks,
+    totalBlocks: job.bitmap.totalBlocks,
+    ranges,
+    finalAudit: true,
+  });
 }
 
 function handleIncoming(linkId: string, frame: ArrayBuffer): void {
@@ -609,51 +1009,68 @@ function ingest(job: RecvJob, frame: ArrayBuffer): void {
   const sink = job.sink!;
   try {
     const { offset, compressed, payload } = decodeFrame(frame);
+    let newlyAcceptedBytes = 0;
+
     const write = (bytes: Uint8Array) => {
       const len = bytes.byteLength;
       if (!job.bench && offset + len > job.size) {
         throw new RangeError(`Frame at ${offset} overruns file size ${job.size}`);
       }
-      job.hasher.update(offset, bytes);
 
-      const t0 = performance.now();
-      const result = sink.write(offset, bytes);
-      if (result) {
-        job.pendingWriteBytes += len;
-        if (job.pendingWriteBytes > job.maxPendingWriteBytes) {
-          job.maxPendingWriteBytes = job.pendingWriteBytes;
-        }
-        job.inflight.add(result);
-        result.then(
-          () => {
-            job.inflight.delete(result);
-            job.pendingWriteBytes = Math.max(0, job.pendingWriteBytes - len);
+      // Process aligned 16 KiB sub-blocks idempotently through BlockBitmap so duplicate
+      // packets (if any) are never hashed or persisted twice.
+      let pos = 0;
+      while (pos < len) {
+        const subOffset = offset + pos;
+        const subLen = Math.min(BLOCK_BYTES, len - pos);
+        const blockIdx = Math.floor(subOffset / BLOCK_BYTES);
+        const isFirstArrival = subOffset % BLOCK_BYTES === 0 ? job.bitmap.markBlock(blockIdx) : true;
+
+        if (isFirstArrival) {
+          const subSlice = bytes.subarray(pos, pos + subLen);
+          job.hasher.update(subOffset, subSlice);
+          newlyAcceptedBytes += subLen;
+
+          const t0 = performance.now();
+          const result = sink.write(subOffset, subSlice);
+          if (result) {
+            job.pendingWriteBytes += subLen;
+            if (job.pendingWriteBytes > job.maxPendingWriteBytes) {
+              job.maxPendingWriteBytes = job.pendingWriteBytes;
+            }
+            job.inflight.add(result);
+            result.then(
+              () => {
+                job.inflight.delete(result);
+                job.pendingWriteBytes = Math.max(0, job.pendingWriteBytes - subLen);
+                job.writeMs += performance.now() - t0;
+                job.persistedBytes += subLen;
+                maybeEmitCredit(job);
+                checkRecvCompletion(job);
+              },
+              (error: unknown) => failRecv(job, `Disk write failed: ${String(error)}`),
+            );
+          } else {
             job.writeMs += performance.now() - t0;
-            job.persistedBytes += len;
+            job.persistedBytes += subLen;
             maybeEmitCredit(job);
-            checkRecvCompletion(job);
-          },
-          (error: unknown) => failRecv(job, `Disk write failed: ${String(error)}`),
-        );
-      } else {
-        job.writeMs += performance.now() - t0;
-        job.persistedBytes += len;
-        maybeEmitCredit(job);
+          }
+        }
+        pos += subLen;
       }
     };
 
-    let rawLength: number;
     if (compressed) {
       if (!codec) throw new Error('LZ4 codec unavailable in receiver worker');
-      rawLength = codec.decompressInto(payload, write);
+      codec.decompressInto(payload, write);
     } else {
       write(payload);
-      rawLength = payload.byteLength;
     }
 
-    if (job.rawBytes === 0) job.startedAt = performance.now();
-    job.rawBytes += rawLength;
+    if (job.rawBytes === 0 && newlyAcceptedBytes > 0) job.startedAt = performance.now();
+    job.rawBytes += newlyAcceptedBytes;
     job.wireBytes += frame.byteLength;
+    maybeEmitRollingNack(job);
   } catch (error) {
     failRecv(job, error instanceof Error ? error.message : String(error));
     return;
@@ -679,7 +1096,20 @@ function ingest(job: RecvJob, frame: ArrayBuffer): void {
 
 function checkRecvCompletion(job: RecvJob): void {
   if (job.finished || job.failed) return;
-  if (job.rawBytes >= job.targetBytes) {
+  const bitmapDone = Number.isFinite(job.targetBytes)
+    ? job.targetBytes === 0 || (job.bitmap.totalBlocks > 0 && job.bitmap.isComplete)
+    : false;
+  if (bitmapDone || job.rawBytes >= job.targetBytes) {
+    if (job.blastEofReceived) {
+      post({
+        type: 'nack-out',
+        transferId: job.id,
+        receivedBlocks: job.bitmap.receivedBlocks,
+        totalBlocks: job.bitmap.totalBlocks,
+        ranges: [],
+        finalAudit: true,
+      });
+    }
     if (job.bench) void finalizeBenchRecv(job);
     else void finalizeRecv(job);
   }
@@ -709,6 +1139,7 @@ async function finalizeBenchRecv(job: RecvJob): Promise<void> {
       writeMs: job.writeMs,
       finalizeMs,
       maxPendingWriteBytes: job.maxPendingWriteBytes,
+      duplicateBlocks: job.bitmap.duplicateBlocks,
       sink: sinkKind,
       hash: job.hasher.digestHex(),
       complete: Number.isFinite(job.targetBytes) ? job.rawBytes === job.targetBytes : true,
@@ -725,15 +1156,21 @@ async function finalizeRecv(job: RecvJob): Promise<void> {
   if (job.finished || job.failed) return;
   job.finished = true;
   if (recvByLink.get(job.linkId) === job.id) recvByLink.delete(job.linkId);
-  const sinkKind = job.sink!.kind;
+  const sink = job.sink!;
+  const sinkKind = sink.kind;
   try {
     const f0 = performance.now();
     await Promise.all(job.inflight);
-    const file = await job.sink!.finalize();
+    const file = await sink.finalize();
     const opfsName = `${job.id}.part`;
     if (job.saveHandle) {
-      await streamToHandle(file, job.saveHandle);
-      await removeInboxFile(opfsName);
+      // Only stream if the sink didn't already write straight to `saveHandle` (`DirectHandleSink` / `RamArenaSink`)!
+      if (!sink.wroteDirectlyToHandle) {
+        await streamToHandle(file, job.saveHandle);
+      }
+      if (sinkKind === 'opfs-sync' || sinkKind === 'opfs-writable') {
+        await removeInboxFile(opfsName);
+      }
       const finalizeMs = performance.now() - f0;
       post({
         type: 'recv-complete',
@@ -748,7 +1185,7 @@ async function finalizeRecv(job: RecvJob): Promise<void> {
       });
     } else {
       const finalizeMs = performance.now() - f0;
-      if (sinkKind !== 'memory' && sinkKind !== 'discard') deliveredFiles.set(job.id, opfsName);
+      if (sinkKind === 'opfs-sync' || sinkKind === 'opfs-writable') deliveredFiles.set(job.id, opfsName);
       post({
         type: 'recv-complete',
         transferId: job.id,
@@ -774,13 +1211,18 @@ async function startRecv(message: Extract<ToWorker, { type: 'recv-start' }>): Pr
     id: message.transferId,
     linkId: message.linkId,
     name: message.name,
+    mime: message.mime ?? 'application/octet-stream',
     size: message.size,
     targetBytes: message.size,
     compress: message.compress,
+    transport: message.transport,
     bench: message.bench,
     saveHandle: message.saveHandle,
     sink: null,
-    creditWindow: INITIAL_HIGH_WATERMARK * 2,
+    bitmap: new BlockBitmap(message.size),
+    nextRollingScanBlock: 0,
+    blastEofReceived: false,
+    creditWindow: INITIAL_HIGH_WATERMARK * 4,
     creditStep: CREDIT_STEP_BYTES,
     lastCreditedBytes: 0,
     backlog: [],
@@ -803,9 +1245,13 @@ async function startRecv(message: Extract<ToWorker, { type: 'recv-start' }>): Pr
 
   try {
     const preferred = message.preferredSink ?? (message.bench ? 'discard' : 'auto');
+    const arenaBudget = message.ramArenaBudget ?? deviceProfile.ramArenaBudget;
     job.sink = await openDiskSink(job.id, job.name, job.size, {
+      mime: job.mime,
       preferredSink: preferred,
       maxMemoryBytes: memorySinkBudget(deviceProfile),
+      ramArenaBudget: message.bench && preferred === 'auto' ? 0 : arenaBudget,
+      saveHandle: message.saveHandle,
     });
   } catch (error) {
     failRecv(job, error instanceof Error ? error.message : String(error));
@@ -848,6 +1294,7 @@ function cancelTransfer(transferId: string, notify: string | null): void {
     sendJobs.delete(transferId);
     releaseJobPause(send);
     releaseCredits(send);
+    releaseRepairWaiters(send);
     const link = links.get(send.linkId);
     if (link) releaseWaiters(link);
     if (notify) post({ type: 'transfer-error', transferId, message: notify });
@@ -872,40 +1319,55 @@ function detachLink(linkId: string, reason: string): void {
   if (!link) return;
   if (link.queueTimer) clearInterval(link.queueTimer);
   link.pool?.dispose();
+  link.blastPool?.dispose();
   releaseWaiters(link);
   links.delete(linkId);
 }
 
-function attachChannels(linkId: string, lane: string, channels: RTCDataChannel[]): void {
+function attachChannels(
+  linkId: string,
+  lane: string,
+  channelKind: 'reliable' | 'blast',
+  channels: RTCDataChannel[],
+): void {
   const link = getLink(linkId);
-  if (!link.pool) {
-    link.pool = new ChannelPool();
+  if (channelKind === 'blast') {
+    if (!link.blastPool) link.blastPool = new ChannelPool();
+    link.blastPool.addLane(lane, channels);
+  } else {
+    if (!link.pool) link.pool = new ChannelPool();
+    link.pool.addLane(lane, channels);
   }
-  link.pool.addLane(lane, channels);
+
   for (const channel of channels) {
     channel.addEventListener('message', (event: MessageEvent<ArrayBuffer>) => {
       if (event.data instanceof ArrayBuffer) enqueueIncoming(linkId, event.data);
     });
-    channel.addEventListener('close', () => {
-      if (lane === '0' && channels.every((c) => c.readyState === 'closed')) {
-        detachLink(linkId, 'Peer link closed');
-      }
-    });
+    if (channelKind === 'reliable') {
+      channel.addEventListener('close', () => {
+        if (lane === '0' && channels.every((c) => c.readyState === 'closed')) {
+          detachLink(linkId, 'Peer link closed');
+        }
+      });
+    }
   }
+
   if (!link.queueTimer) {
     link.queueTimer = setInterval(() => {
-      if (!link.pool) return;
+      const activePool =
+        link.blastPool && link.blastPool.totalBuffered > 0 ? link.blastPool : link.pool ?? link.blastPool;
+      if (!activePool) return;
       post({
         type: 'queue',
         linkId,
-        buffered: link.pool.bufferedAmounts,
-        lanes: link.pool.channelLaneIds,
-        active: link.pool.activeChannelCount,
-        highWatermark: link.pool.highWatermark,
+        buffered: activePool.bufferedAmounts,
+        lanes: activePool.channelLaneIds,
+        active: activePool.activeChannelCount,
+        highWatermark: activePool.highWatermark,
       });
     }, 200);
   }
-  post({ type: 'attached', linkId, lane });
+  post({ type: 'attached', linkId, lane, channelKind });
 }
 
 // ───────────────────────────── Boot ─────────────────────────────
@@ -936,17 +1398,19 @@ scope.addEventListener('message', (event) => {
       void boot();
       break;
     case 'attach-channels':
-      attachChannels(message.linkId, message.lane, message.channels);
+      attachChannels(message.linkId, message.lane, message.channelKind ?? 'reliable', message.channels);
       break;
     case 'detach-lane': {
       const link = links.get(message.linkId);
-      const removed = link?.pool?.removeLane(message.lane);
-      if (removed) {
-        for (const ch of removed) {
-          try {
-            ch.close();
-          } catch {
-            // Ignore.
+      for (const p of [link?.pool, link?.blastPool]) {
+        const removed = p?.removeLane(message.lane);
+        if (removed) {
+          for (const ch of removed) {
+            try {
+              ch.close();
+            } catch {
+              // Ignore.
+            }
           }
         }
       }
@@ -963,22 +1427,31 @@ scope.addEventListener('message', (event) => {
       );
       break;
     case 'send-start': {
+      const file = message.file;
       const job: SendJob = {
         id: message.transferId,
         linkId: message.linkId,
-        file: message.file,
+        file,
+        fileCachePrefix: file ? `${file.name}:${file.size}:${file.lastModified}` : `bench:${message.transferId}`,
+        preloadedMacros: null,
         syntheticBytes: message.syntheticBytes,
         compressibleBench: Boolean(message.compressibleBench),
         forceBridge: Boolean(message.forceBridge),
         compress: message.compress,
+        transport: message.transport,
         creditWindow: message.creditWindow,
         creditedBytes: 0,
         creditWaiters: [],
+        ramPreloadBudget: message.ramPreloadBudget ?? deviceProfile.senderRamPreloadBudget,
         durationMs: message.durationMs,
         pinned: message.pinned ?? null,
         cancelled: false,
         userPaused: false,
         pauseWaiters: [],
+        repairQueue: [],
+        repairWaiters: [],
+        finalAuditComplete: false,
+        retransmittedBlocks: 0,
         rawBytes: 0,
         wireBytes: 0,
         lastProgress: 0,
@@ -998,24 +1471,49 @@ scope.addEventListener('message', (event) => {
         .finally(() => sendJobs.delete(job.id));
       break;
     }
+    case 'nack-in': {
+      const job = sendJobs.get(message.transferId);
+      if (!job || job.cancelled) break;
+      if (message.finalAudit && message.ranges.length === 0) {
+        job.finalAuditComplete = true;
+        releaseRepairWaiters(job);
+        break;
+      }
+      for (const r of message.ranges) {
+        if (r[1] > 0) job.repairQueue.push([r[0], r[1]]);
+      }
+      if (message.finalAudit) {
+        releaseRepairWaiters(job);
+      }
+      break;
+    }
     case 'bridge-stats': {
       const link = getLink(message.linkId);
       link.bridgeSentBytes = message.sentBytes;
       link.bridgeBuffered = message.buffered;
       link.bridgeOpenLanes = Math.max(1, message.openLanes);
+      if (message.blastSentBytes !== undefined) link.blastBridgeSentBytes = message.blastSentBytes;
+      if (message.blastBuffered !== undefined) link.blastBridgeBuffered = message.blastBuffered;
+      if (message.blastOpenLanes !== undefined) link.blastBridgeOpenLanes = Math.max(1, message.blastOpenLanes);
       break;
     }
     case 'flow': {
       const link = getLink(message.linkId);
-      link.paused = message.paused;
+      if (message.blast) link.blastPaused = message.paused;
+      else link.paused = message.paused;
       if (!message.paused) releaseWaiters(link);
       break;
     }
     case 'bridge-ack': {
       const link = getLink(message.linkId);
-      link.inFlightBytes = Math.max(0, link.inFlightBytes - message.bytes);
-      link.paused = message.paused;
-      if (!link.paused) releaseWaiters(link);
+      if (message.blast) {
+        link.blastInFlightBytes = Math.max(0, link.blastInFlightBytes - message.bytes);
+        link.blastPaused = message.paused;
+      } else {
+        link.inFlightBytes = Math.max(0, link.inFlightBytes - message.bytes);
+        link.paused = message.paused;
+      }
+      if (!message.paused) releaseWaiters(link);
       break;
     }
     case 'credit': {
@@ -1051,16 +1549,36 @@ scope.addEventListener('message', (event) => {
     case 'recv-start':
       void startRecv(message);
       break;
+    case 'blast-eof-in': {
+      const job = recvJobs.get(message.transferId);
+      if (job && !job.finished && !job.failed) {
+        job.blastEofReceived = true;
+        job.targetBytes = message.totalBytes;
+        job.bitmap.setFinalByteSize(message.totalBytes);
+        // Allow 12 ms for any trailing UDP datagrams already in OS receive buffers to land before scanning bitmap
+        setTimeout(() => {
+          if (!job.finished && !job.failed) performFinalBlastAudit(job);
+        }, 12);
+      }
+      break;
+    }
     case 'bench-stop': {
       const job = recvJobs.get(message.transferId);
       if (job && job.bench && !job.finished && !job.failed) {
         job.targetBytes = message.bytes;
-        checkRecvCompletion(job);
-        // Unordered frames on parallel lanes may still be in flight for a few RTTs after ctrl bench-stop.
+        job.bitmap.setFinalByteSize(message.bytes);
+        if (message.blast) {
+          job.blastEofReceived = true;
+          setTimeout(() => {
+            if (!job.finished && !job.failed) performFinalBlastAudit(job);
+          }, 12);
+        } else {
+          checkRecvCompletion(job);
+        }
         if (!job.finished && job.benchStopTimer === null) {
           job.benchStopTimer = setTimeout(() => {
             if (!job.finished && !job.failed) void finalizeBenchRecv(job);
-          }, 3_000);
+          }, 4_500);
         }
       }
       break;
@@ -1079,5 +1597,4 @@ scope.addEventListener('message', (event) => {
   }
 });
 
-// Keep DEFAULT_CHUNK referenced for bundler completeness
 void DEFAULT_CHUNK;

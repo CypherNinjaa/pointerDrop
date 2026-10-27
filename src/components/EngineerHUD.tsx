@@ -1,12 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
-import { formatBytes, type IceRoute, type SinkKind } from '../engine/protocol';
+import { formatBytes, type IceRoute, type SinkKind, type TransportMode } from '../engine/protocol';
 import type { TelemetryHUDState } from '../engine/webrtc';
 
 export interface EngineerHUDProps {
   hud: TelemetryHUDState;
   compact: boolean;
   onOpenBenchmark?: () => void;
+  onChangeTransportMode?: (mode: TransportMode) => void;
 }
 
 const ROUTE_DESC: Record<IceRoute, { label: string; short: string; colorClass: string; dotClass: string }> = {
@@ -37,16 +38,23 @@ const ROUTE_DESC: Record<IceRoute, { label: string; short: string; colorClass: s
 };
 
 function describeSink(sink: SinkKind | null, opfsSyncReady: boolean, opfsReady: boolean, secure: boolean): string {
-  if (sink === 'opfs-sync') return 'OPFS SyncAccessHandle';
-  if (sink === 'opfs-writable') return 'OPFS Async Writable';
+  if (sink === 'ram-arena') return 'RAM Turbo Arena (Zero-I/O)';
+  if (sink === 'direct-handle') return 'Direct OS FileHandle (Zero-OPFS)';
+  if (sink === 'opfs-sync') return 'OPFS Sync (2 MiB Coalesced)';
+  if (sink === 'opfs-writable') return 'OPFS Stream (2 MiB Coalesced)';
   if (sink === 'memory') return 'Bounded RAM';
   if (sink === 'discard') return 'Benchmark Discard';
-  if (opfsSyncReady) return 'OPFS Sync Ready';
-  if (opfsReady) return 'OPFS Stream Ready';
-  return secure ? 'Bounded RAM' : 'RAM Only (Plain HTTP)';
+  if (opfsSyncReady) return 'RAM Arena + Direct OS Disk Ready';
+  if (opfsReady) return 'RAM Arena + OPFS Ready';
+  return secure ? 'RAM Turbo Arena Ready' : 'RAM Only (Plain HTTP)';
 }
 
-export const EngineerHUD: React.FC<EngineerHUDProps> = ({ hud, compact, onOpenBenchmark }) => {
+export const EngineerHUD: React.FC<EngineerHUDProps> = ({
+  hud,
+  compact,
+  onOpenBenchmark,
+  onChangeTransportMode,
+}) => {
   const [expanded, setExpanded] = useState(false);
   const reduceMotion = useReducedMotion();
 
@@ -84,10 +92,13 @@ export const EngineerHUD: React.FC<EngineerHUDProps> = ({ hud, compact, onOpenBe
         ? routeInfo.short
         : `${routeInfo.short} (${hud.candidatePairLabel})`;
 
+  const isBlast = hud.activeTransport === 'blast-nack';
+  const isBloatGuarded = hud.tuner?.bottleneck === 'bufferbloat';
+
   return (
     <aside
       aria-label="Network telemetry HUD"
-      className={`z-30 mx-auto w-full ${compact ? 'max-w-full' : 'max-w-[740px]'}`}
+      className={`z-30 mx-auto w-full ${compact ? 'max-w-full' : 'max-w-[780px]'}`}
     >
       <div className="glass-pill overflow-hidden rounded-[22px]">
         {/* Collapsed Dynamic Island Pill Trigger */}
@@ -111,18 +122,34 @@ export const EngineerHUD: React.FC<EngineerHUDProps> = ({ hud, compact, onOpenBe
             </span>
           </div>
 
-          <div className="flex shrink-0 items-center gap-2.5">
+          <div className="flex shrink-0 items-center gap-2">
+            {!compact && (
+              <span
+                className={`rounded-full border px-2 py-0.5 font-mono text-[10px] font-medium ${
+                  isBlast
+                    ? 'border-lime-signal/40 bg-lime-signal/12 text-lime-signal'
+                    : 'border-cyan-ice/35 bg-cyan-warp/15 text-cyan-ice'
+                }`}
+              >
+                {isBlast ? 'Blast+NACK' : 'Rel-SCTP'}
+              </span>
+            )}
+
             {!compact && (
               <span className="tabular-nums rounded-full border border-white/12 bg-white/[0.05] px-2 py-0.5 font-mono text-[10px] text-ink-secondary">
                 {Math.round(hud.chunkSize / 1024)}K · {hud.activeLanes}L
               </span>
             )}
 
-            <span className="tabular-nums font-mono text-[11px] text-ink-secondary">
+            <span
+              className={`tabular-nums font-mono text-[11px] ${
+                isBloatGuarded ? 'text-amber-system' : 'text-ink-secondary'
+              }`}
+            >
               {hud.rttMs !== null ? `${hud.rttMs.toFixed(1)} ms` : '— ms'}
             </span>
 
-            {/* Mini channel queue meter (caps at 8 bars in collapsed pill) */}
+            {/* Mini channel queue meter */}
             <div
               className="flex h-3.5 items-end gap-0.5"
               aria-hidden="true"
@@ -184,54 +211,130 @@ export const EngineerHUD: React.FC<EngineerHUDProps> = ({ hud, compact, onOpenBe
                 </div>
 
                 <div className="calm-row rounded-xl p-2.5">
-                  <div className="text-[10px] uppercase tracking-wider text-ink-tertiary">Link RTT</div>
+                  <div className="text-[10px] uppercase tracking-wider text-ink-tertiary">RTT & Bloat Guard</div>
                   <div className="tabular-nums mt-0.5 font-mono text-sm font-semibold text-ink-primary">
                     {hud.rttMs !== null ? `${hud.rttMs.toFixed(1)} ms` : '—'}
                   </div>
                   <div className="truncate font-mono text-[10px] text-ink-tertiary">
-                    {hud.peerName ? `Peer: ${hud.peerName}` : 'No active peer'}
+                    {hud.tuner
+                      ? `min ${hud.tuner.minRttMs.toFixed(1)} ms · +${hud.tuner.bloatMs.toFixed(0)} ms`
+                      : hud.peerName
+                        ? `Peer: ${hud.peerName}`
+                        : 'No active peer'}
                   </div>
                 </div>
 
                 <div className="calm-row rounded-xl p-2.5">
-                  <div className="text-[10px] uppercase tracking-wider text-ink-tertiary">Dynamic Frame & Lanes</div>
+                  <div className="text-[10px] uppercase tracking-wider text-ink-tertiary">Transport & Frame</div>
                   <div className="tabular-nums mt-0.5 font-mono text-sm font-semibold text-ink-primary">
                     {Math.round(hud.chunkSize / 1024)} KB · {hud.activeLanes}L
                   </div>
                   <div className="tabular-nums font-mono text-[10px] text-ink-tertiary">
-                    SCTP max {hud.maxSctpMessageSize ? formatBytes(hud.maxSctpMessageSize, 0) : 'auto'} ·{' '}
-                    {hud.connectedLanes} PC
+                    {isBlast ? 'UDP Blast + Bitmap NACK' : 'Reliable Unordered SCTP'}
+                    {hud.tuner && hud.tuner.retransmittedBlocks > 0
+                      ? ` (${hud.tuner.retransmittedBlocks} blk)`
+                      : ''}
                   </div>
                 </div>
 
                 <div className="calm-row rounded-xl p-2.5">
-                  <div className="text-[10px] uppercase tracking-wider text-ink-tertiary">Compression</div>
-                  <div className="tabular-nums mt-0.5 font-mono text-sm font-semibold text-ink-primary">
-                    {compressionText}
+                  <div className="text-[10px] uppercase tracking-wider text-ink-tertiary">RAM / Storage Sink</div>
+                  <div className="tabular-nums mt-0.5 truncate font-mono text-sm font-semibold text-ink-primary">
+                    {hud.sink === 'ram-arena'
+                      ? 'RAM Arena'
+                      : hud.sink === 'direct-handle'
+                        ? 'Direct Disk'
+                        : compressionText}
                   </div>
                   <div className="font-mono text-[10px] text-ink-tertiary">
                     {hud.receiverPendingBytes > 0
-                      ? `Rx queue ${formatBytes(hud.receiverPendingBytes, 0)}`
-                      : 'Credit flow ready'}
+                      ? `Rx write ${formatBytes(hud.receiverPendingBytes, 0)}`
+                      : hud.concurrentTransfers > 1
+                        ? `${hud.concurrentTransfers} concurrent streams`
+                        : 'Zero-I/O credit ready'}
                   </div>
                 </div>
               </div>
 
-              {/* Dynamic Autotuner + Speed Test Action */}
+              {/* Scanned Sender ↔ Receiver System Hardware & Transport Mode Selector */}
+              <div className="calm-row mt-2.5 rounded-xl p-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium text-ink-secondary">Scanned System & Link Topology</span>
+                    <span className="rounded border border-white/12 bg-white/[0.04] px-1.5 py-0.5 font-mono text-[10px] text-cyan-ice">
+                      {hud.topologyLabel}
+                    </span>
+                  </div>
+
+                  {onChangeTransportMode && (
+                    <div
+                      role="group"
+                      aria-label="Transport engine mode"
+                      className="flex items-center gap-0.5 rounded-full border border-white/12 bg-black/45 p-0.5 font-mono text-[10px]"
+                    >
+                      {(
+                        [
+                          { id: 'auto', label: 'Auto' },
+                          { id: 'blast-nack', label: 'Blast+NACK' },
+                          { id: 'reliable-sctp', label: 'Rel-SCTP' },
+                        ] as const
+                      ).map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => onChangeTransportMode(opt.id)}
+                          className={`warp-btn rounded-full px-2 py-0.5 ${
+                            hud.transportMode === opt.id
+                              ? 'bg-cyan-warp font-semibold text-white'
+                              : 'text-ink-tertiary hover:text-white'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-1.5 grid gap-1 font-mono text-[10px] text-ink-tertiary sm:grid-cols-2">
+                  <div className="truncate">
+                    <span className="text-ink-secondary">Local:</span>{' '}
+                    {hud.selfHw
+                      ? `${hud.selfHw.summary} · RAM Arena ${formatBytes(hud.selfHw.ramArenaBudget, 0)}`
+                      : 'Scanning hardware…'}
+                  </div>
+                  <div className="truncate">
+                    <span className="text-ink-secondary">Peer:</span>{' '}
+                    {hud.peerHw
+                      ? `${hud.peerHw.summary} · RAM Arena ${formatBytes(hud.peerHw.ramArenaBudget, 0)}`
+                      : hud.peerName
+                        ? `${hud.peerName} (awaiting handshake)`
+                        : 'Pair a peer to scan remote hardware'}
+                  </div>
+                </div>
+              </div>
+
+              {/* Dynamic BBR Autotuner + Speed Test Action */}
               <div className="calm-row mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-xl p-2.5">
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2 text-[11px]">
-                    <span className="font-medium text-ink-secondary">Adaptive Transport Tuner</span>
+                    <span className="font-medium text-ink-secondary">BBR Delay-Aware Autotuner</span>
                     {hud.tuner && (
-                      <span className="rounded border border-cyan-ice/35 bg-cyan-warp/15 px-1.5 py-0.5 font-mono text-[10px] text-cyan-ice">
+                      <span
+                        className={`rounded border px-1.5 py-0.5 font-mono text-[10px] ${
+                          isBloatGuarded
+                            ? 'border-amber-system/45 bg-amber-system/15 text-amber-system'
+                            : 'border-cyan-ice/35 bg-cyan-warp/15 text-cyan-ice'
+                        }`}
+                      >
                         {hud.tuner.phase} · {hud.tuner.bottleneck}
                       </span>
                     )}
                   </div>
                   <div className="mt-0.5 truncate font-mono text-[10px] text-ink-tertiary">
                     {hud.tuner
-                      ? `${hud.tuner.lastDecision} (Wait Q:${hud.tuner.queueWaitPct}% Cred:${hud.tuner.creditWaitPct}% Disk:${hud.tuner.diskWaitPct}%)`
-                      : 'Auto-climbs 16–256 KiB chunks, parallel SCTP lanes & BDP watermarks on every transfer'}
+                      ? `${hud.tuner.lastDecision} (Q:${hud.tuner.queueWaitPct}% Cred:${hud.tuner.creditWaitPct}% Disk:${hud.tuner.diskWaitPct}%)`
+                      : 'Sizes BDP strictly from minRTT, guards against Wi-Fi TX bufferbloat & repairs dropped 16 KB blocks'}
                   </div>
                 </div>
                 {onOpenBenchmark && (
@@ -288,7 +391,7 @@ export const EngineerHUD: React.FC<EngineerHUDProps> = ({ hud, compact, onOpenBe
               <div className="calm-row mt-2.5 rounded-xl p-2.5">
                 <div className="flex flex-wrap items-center justify-between gap-1 text-[11px]">
                   <span className="font-medium text-ink-secondary">
-                    Striped Unordered DataChannels ({hud.activeChannels} active across {hud.activeLanes} SCTP{' '}
+                    Striped DataChannels ({hud.activeChannels} active across {hud.activeLanes}{' '}
                     {hud.activeLanes === 1 ? 'lane' : 'lanes'})
                   </span>
                   <span className="tabular-nums font-mono text-[10px] text-ink-tertiary">
